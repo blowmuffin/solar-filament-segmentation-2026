@@ -1,0 +1,5 @@
+__pycache__/
+.ipynb_checkpoints/
+*.npz
+*.pkl
+.pytest_cache/

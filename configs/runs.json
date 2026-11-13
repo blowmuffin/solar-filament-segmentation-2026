@@ -1,0 +1,1 @@
+{"A": {}, "A2": {"seed": 1}, "B": {"work_res": 1024}, "C": {"crop": 768, "batch": 8}, "smokeA": {"epochs": 1, "steps": 30}, "smokeB": {"work_res": 1024, "epochs": 1, "steps": 30}}
