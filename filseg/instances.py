@@ -99,11 +99,12 @@ class _Slabs:
         self.zf.close()
 
 
-def iter_probs(runs: list[str], split: str, root=RUNS):
+def iter_probs(runs: list[str], split: str, root=RUNS, folds: list[int] | None = None):
     """Yield (stem, float32 prob in [0, 1]) in file order. A stem's maps are averaged over every
-    <split>_fold*.npz of every run that holds it; a stem must come from every run, and for oof from exactly
-    one fold file per run. One map per file is in memory at a time."""
-    files = [(r, p) for r in runs for p in sorted((Path(root) / r).glob(f"{split}_fold*.npz"))]
+    <split>_fold*.npz of every run that holds it (only those of `folds` when given); a stem must come from
+    every run, and for oof from exactly one fold file per run. One map per file is in memory at a time."""
+    files = [(r, p) for r in runs for p in sorted((Path(root) / r).glob(f"{split}_fold*.npz"))
+             if folds is None or int(p.stem.rsplit("fold", 1)[1]) in folds]
     if not files:
         raise FileNotFoundError(f"no {split}_fold*.npz under {root} for runs {runs}")
     readers = [_Slabs(p, r) for r, p in files]
@@ -127,14 +128,15 @@ def iter_probs(runs: list[str], split: str, root=RUNS):
             rd.close()
 
 
-def run(runs: list[str], split: str, rule: Rule, out, root=RUNS, stems: set[str] | None = None) -> dict:
+def run(runs: list[str], split: str, rule: Rule, out, root=RUNS, stems: set[str] | None = None,
+        folds: list[int] | None = None) -> dict:
     """Average the maps, apply the rule, write the CSV and validate it. Returns the preds."""
     from filseg import preflight as pf
     if stems is None:
         stems = ({p.stem for p in TEST_IMG.glob("*.jpeg")} if split == "test"
                  else set(json.loads(FOLDS_JSON.read_text(encoding="utf-8"))))
     preds = {}
-    for stem, prob in iter_probs(runs, split, root):
+    for stem, prob in iter_probs(runs, split, root, folds):
         labels, cands = candidates(prob, rule.t_lo)
         kept = select(cands, rule)
         preds[stem] = to_rles(labels, kept)
@@ -159,9 +161,10 @@ def _main(argv: list[str] | None = None) -> None:
     ap.add_argument("--rule", required=True, help="rule.json written by tune")
     ap.add_argument("--out", required=True)
     ap.add_argument("--runs-root", default=str(RUNS))
+    ap.add_argument("--folds", nargs="+", type=int, help="only these <split>_fold<k>.npz files (default all)")
     a = ap.parse_args(argv)
     rule = Rule(**json.loads(Path(a.rule).read_text(encoding="utf-8")))
-    preds = run(a.run, a.split, rule, a.out, root=a.runs_root)
+    preds = run(a.run, a.split, rule, a.out, root=a.runs_root, folds=a.folds)
     n = sum(map(len, preds.values()))
     print(f"wrote {a.out}: {len(preds)} images, {n} masks ({n / len(preds):.2f} per image), validated")
 

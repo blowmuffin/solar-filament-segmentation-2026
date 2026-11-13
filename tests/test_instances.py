@@ -95,6 +95,16 @@ def test_iter_probs_oof_checks_coverage(tmp_path):
         list(inst.iter_probs(["A"], "test", tmp_path))
 
 
+def test_iter_probs_restricts_to_folds(tmp_path):
+    (tmp_path / "A").mkdir()
+    blob = np.zeros((2048, 2048), np.uint8); blob[1000:1030, 1000:1030] = 230
+    _npz(tmp_path / "A" / "oof_fold0.npz", ["s0"], [blob]); _npz(tmp_path / "A" / "oof_fold1.npz", ["s1"], [blob])
+    assert [s for s, _ in inst.iter_probs(["A"], "oof", tmp_path, folds=[1])] == ["s1"]
+    assert [s for s, _ in inst.iter_probs(["A"], "oof", tmp_path)] == ["s0", "s1"]
+    with pytest.raises(FileNotFoundError):
+        list(inst.iter_probs(["A"], "oof", tmp_path, folds=[2]))
+
+
 def test_run_end_to_end(tmp_path):
     blob = np.zeros((2048, 2048), np.uint8); blob[1000:1030, 1000:1030] = 230      # 900 px, p = 0.90
     (tmp_path / "A").mkdir()
