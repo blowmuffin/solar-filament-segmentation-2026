@@ -2,7 +2,7 @@
 import argparse
 import json
 import zipfile
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import cv2
@@ -99,15 +99,30 @@ class _Slabs:
         self.zf.close()
 
 
+def _fold(path: Path) -> int:
+    return int(path.stem.rsplit("fold", 1)[1])
+
+
+def _fold_files(runs: list[str], split: str, root, folds: list[int] | None) -> list[tuple[str, Path]]:
+    files = [(r, p) for r in runs for p in sorted((Path(root) / r).glob(f"{split}_fold*.npz"))
+             if folds is None or _fold(p) in folds]
+    if not files:
+        raise FileNotFoundError(f"no {split}_fold*.npz under {root} for runs {runs}")
+    return files
+
+
+def _json_or_none(path: Path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
 def iter_probs(runs: list[str], split: str, root=RUNS, folds: list[int] | None = None):
     """Yield (stem, float32 prob in [0, 1]) in file order. A stem's maps are averaged over every
     <split>_fold*.npz of every run that holds it (only those of `folds` when given); a stem must come from
     every run, and for oof from exactly one fold file per run. One map per file is in memory at a time."""
-    files = [(r, p) for r in runs for p in sorted((Path(root) / r).glob(f"{split}_fold*.npz"))
-             if folds is None or int(p.stem.rsplit("fold", 1)[1]) in folds]
-    if not files:
-        raise FileNotFoundError(f"no {split}_fold*.npz under {root} for runs {runs}")
-    readers = [_Slabs(p, r) for r, p in files]
+    readers = [_Slabs(p, r) for r, p in _fold_files(runs, split, root, folds)]
     try:
         where: dict[str, list] = {}
         for rd in readers:
@@ -129,12 +144,22 @@ def iter_probs(runs: list[str], split: str, root=RUNS, folds: list[int] | None =
 
 
 def run(runs: list[str], split: str, rule: Rule, out, root=RUNS, stems: set[str] | None = None,
-        folds: list[int] | None = None) -> dict:
-    """Average the maps, apply the rule, write the CSV and validate it. Returns the preds."""
+        folds: list[int] | None = None, expect_folds: int | None = None, rule_file=None) -> dict:
+    """Average the maps, apply the rule, write the CSV, validate it and write the provenance sidecar
+    `<out>.meta.json` (what pre-flight reads). Prints the fold files found per run; expect_folds raises when a
+    run has another number of fold files for the split. Returns the preds."""
     from filseg import preflight as pf
     if stems is None:
         stems = ({p.stem for p in TEST_IMG.glob("*.jpeg")} if split == "test"
                  else set(json.loads(FOLDS_JSON.read_text(encoding="utf-8"))))
+    meta_file = Path(str(out) + ".meta.json")
+    meta_file.unlink(missing_ok=True)               # a failed build must not leave the previous build's record
+    files = _fold_files(runs, split, root, folds)
+    found = {r: [_fold(p) for q, p in files if q == r] for r in runs}
+    for r, ks in found.items():
+        print(f"{r}: {split} fold files {ks}")
+        if expect_folds is not None and len(ks) != expect_folds:
+            raise ValueError(f"{r}: {len(ks)} {split} fold files {ks}, expected {expect_folds}")
     preds = {}
     for stem, prob in iter_probs(runs, split, root, folds):
         labels, cands = candidates(prob, rule.t_lo)
@@ -149,8 +174,21 @@ def run(runs: list[str], split: str, rule: Rule, out, root=RUNS, stems: set[str]
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     write_submission(preds, out)
     pf.validate_submission(out, stems)
-    if not pf.roundtrip_equal(out, preds):
+    roundtrip = pf.roundtrip_equal(out, preds)
+    if not roundtrip:
         raise ValueError(f"{out} does not read back as the masks in memory")
+    status = pf._git(["status", "--porcelain"], REPO)
+    meta = dict(
+        csv_sha256=pf.sha256_file(out), rows=sum(map(len, preds.values())), images=len(preds), split=split, runs=runs,
+        folds_requested=folds, folds_found=found, folds=sorted({k for ks in found.values() for k in ks}),
+        files=[dict(run=r, file=p.name, sha256=pf.sha256_file(p)[:12], meta=_json_or_none(p.with_name(f"fold{_fold(p)}_meta.json")))
+               for r, p in files],
+        run_meta={r: _json_or_none(Path(root) / r / "meta.json") for r in runs},
+        rule=asdict(rule), rule_file=None if rule_file is None else str(rule_file),
+        rule_sha256=None if rule_file is None else pf.sha256_file(rule_file),
+        commit=pf._git(["rev-parse", "HEAD"], REPO), dirty=None if status is None else status != "",
+        roundtrip_equal=roundtrip)                  # the per-mask decode check above raised if it failed
+    meta_file.write_text(json.dumps(meta, indent=1) + "\n", encoding="utf-8")
     return preds
 
 
@@ -162,9 +200,11 @@ def _main(argv: list[str] | None = None) -> None:
     ap.add_argument("--out", required=True)
     ap.add_argument("--runs-root", default=str(RUNS))
     ap.add_argument("--folds", nargs="+", type=int, help="only these <split>_fold<k>.npz files (default all)")
+    ap.add_argument("--expect-folds", type=int, help="raise unless every run has exactly this many fold files")
     a = ap.parse_args(argv)
     rule = Rule(**json.loads(Path(a.rule).read_text(encoding="utf-8")))
-    preds = run(a.run, a.split, rule, a.out, root=a.runs_root, folds=a.folds)
+    preds = run(a.run, a.split, rule, a.out, root=a.runs_root, folds=a.folds, expect_folds=a.expect_folds,
+                rule_file=a.rule)
     n = sum(map(len, preds.values()))
     print(f"wrote {a.out}: {len(preds)} images, {n} masks ({n / len(preds):.2f} per image), validated")
 

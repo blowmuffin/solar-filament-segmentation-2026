@@ -1,4 +1,8 @@
+import hashlib
 import json
+import subprocess
+from dataclasses import asdict
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -6,6 +10,7 @@ from pycocotools import mask as mask_util
 
 from filseg import instances as inst
 from filseg import preflight as pf
+from filseg.data import FOLDS_JSON
 
 
 def test_components_8_connected():
@@ -124,3 +129,78 @@ def test_run_end_to_end(tmp_path):
     _npz(tmp_path / "A" / "test_fold0.npz", ["has_one"], [blob])
     with pytest.raises(ValueError, match="stems do not match"):                # test split must cover every image
         inst.run(["A"], "test", inst.Rule(), out, tmp_path, stems={"has_one", "never_predicted"})
+
+
+# ---- fix round 1: provenance sidecar and fold-count reporting (review I2, I4) ----
+
+def _sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _two_folds(tmp_path, stems=("has_one", "empty_stem")):
+    blob = np.zeros((2048, 2048), np.uint8); blob[1000:1030, 1000:1030] = 230
+    (tmp_path / "A").mkdir(exist_ok=True)
+    _npz(tmp_path / "A" / "oof_fold0.npz", [stems[0]], [blob])
+    _npz(tmp_path / "A" / "oof_fold1.npz", [stems[1]], [np.zeros_like(blob)])
+
+
+def test_run_writes_provenance_sidecar(tmp_path, monkeypatch):
+    monkeypatch.setattr(pf, "_git", lambda args, repo: "c0ffee" if args[0] == "rev-parse" else "")
+    _two_folds(tmp_path)
+    (tmp_path / "A" / "fold0_meta.json").write_text(json.dumps({"commit": "k0", "ok": True}), encoding="utf-8")
+    rule_file = tmp_path / "rule.json"; rule_file.write_text(json.dumps(asdict(inst.Rule())), encoding="utf-8")
+    out = tmp_path / "s.csv"
+    inst.run(["A"], "oof", inst.Rule(), out, tmp_path, stems={"has_one", "empty_stem"}, rule_file=rule_file)
+    m = json.loads(Path(str(out) + ".meta.json").read_text(encoding="utf-8"))
+    assert m["csv_sha256"] == _sha(out) and (m["rows"], m["images"]) == (1, 2)
+    assert (m["commit"], m["dirty"], m["roundtrip_equal"]) == ("c0ffee", False, True)
+    assert m["rule"] == asdict(inst.Rule()) and m["rule_sha256"] == _sha(rule_file)
+    assert (m["runs"], m["split"], m["folds"], m["folds_found"]) == (["A"], "oof", [0, 1], {"A": [0, 1]})
+    f0, f1 = m["files"]
+    assert (f0["run"], f0["file"], f0["sha256"]) == ("A", "oof_fold0.npz", _sha(tmp_path / "A" / "oof_fold0.npz")[:12])
+    assert f0["meta"] == {"commit": "k0", "ok": True} and f1["meta"] is None
+
+
+def test_sidecar_records_a_dirty_tree(tmp_path, monkeypatch):
+    repo = tmp_path / "r"; repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    monkeypatch.setattr(inst, "REPO", repo)
+    _two_folds(tmp_path)
+    side = tmp_path / "s.csv.meta.json"
+    inst.run(["A"], "oof", inst.Rule(), tmp_path / "s.csv", tmp_path, stems={"has_one", "empty_stem"})
+    assert json.loads(side.read_text(encoding="utf-8"))["dirty"] is False
+    (repo / "x.txt").write_text("x", encoding="utf-8")
+    inst.run(["A"], "oof", inst.Rule(), tmp_path / "s.csv", tmp_path, stems={"has_one", "empty_stem"})
+    assert json.loads(side.read_text(encoding="utf-8"))["dirty"] is True
+
+
+def test_failed_build_leaves_no_stale_sidecar(tmp_path):
+    _two_folds(tmp_path)
+    inst.run(["A"], "oof", inst.Rule(), tmp_path / "s.csv", tmp_path, stems={"has_one", "empty_stem"})
+    assert (tmp_path / "s.csv.meta.json").exists()
+    with pytest.raises(ValueError, match="stems do not match"):
+        inst.run(["A"], "oof", inst.Rule(), tmp_path / "s.csv", tmp_path, stems={"only_this"})
+    assert not (tmp_path / "s.csv.meta.json").exists()
+
+
+def test_run_reports_and_enforces_fold_count(tmp_path, capsys):
+    _two_folds(tmp_path)
+    kw = dict(stems={"has_one", "empty_stem"})
+    inst.run(["A"], "oof", inst.Rule(), tmp_path / "s.csv", tmp_path, expect_folds=2, **kw)
+    assert "A: oof fold files [0, 1]" in capsys.readouterr().out
+    with pytest.raises(ValueError, match="expected 3"):
+        inst.run(["A"], "oof", inst.Rule(), tmp_path / "s.csv", tmp_path, expect_folds=3, **kw)
+    with pytest.raises(ValueError, match="A: 1 oof fold file"):                  # the folds= filter counts too
+        inst.run(["A"], "oof", inst.Rule(), tmp_path / "s.csv", tmp_path, folds=[0], expect_folds=2, **kw)
+
+
+def test_main_records_rule_file_and_enforces_expect_folds(tmp_path, capsys):
+    stems = sorted(json.loads(FOLDS_JSON.read_text(encoding="utf-8")))[:2]
+    _two_folds(tmp_path, stems)
+    rule = tmp_path / "rule.json"; rule.write_text(json.dumps(asdict(inst.Rule())), encoding="utf-8")
+    argv = ["--run", "A", "--split", "oof", "--rule", str(rule), "--out", str(tmp_path / "s.csv"), "--runs-root", str(tmp_path)]
+    inst._main(argv + ["--expect-folds", "2"])
+    assert "A: oof fold files [0, 1]" in capsys.readouterr().out
+    assert json.loads((tmp_path / "s.csv.meta.json").read_text(encoding="utf-8"))["rule_sha256"] == _sha(rule)
+    with pytest.raises(ValueError, match="expected 3"):
+        inst._main(argv + ["--expect-folds", "3"])

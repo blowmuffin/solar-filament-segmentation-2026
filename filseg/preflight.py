@@ -15,7 +15,7 @@ from filseg import pq
 from filseg.data import CX, CY, FOLDS_JSON, H, R, REPO, TEST_IMG, W, load_image
 
 HEADER = "filament_id,segmentation_rle"
-RULE_JSON = REPO / "filseg" / "rule.json"
+SUBS = (REPO / ".." / "subs").resolve()      # CSVs of our entries: s<digit>...csv
 NEAR_COPY_PQ = 0.98
 
 
@@ -95,6 +95,32 @@ def validate_submission(path, stems: set[str]) -> None:
     _scan(path, stems)
 
 
+def sha256_file(path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def meta_path(csv) -> Path:
+    return Path(str(csv) + ".meta.json")
+
+
+def read_meta(csv) -> dict | None:
+    """The provenance sidecar `instances.run` wrote at build time, None if missing or unreadable."""
+    try:
+        return json.loads(meta_path(csv).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def earlier_entries(path, subs_dir) -> list[Path]:
+    """Our entry files in subs_dir (s<digit>...csv), without this file and without *_oof.csv twins."""
+    me = Path(path).resolve()
+    return sorted(p for p in Path(subs_dir).glob("s[0-9]*.csv") if not p.name.endswith("_oof.csv") and p.resolve() != me)
+
+
 def read_submission(path) -> dict[str, list[dict]]:
     """stem -> RLE dicts in k order (the file is assumed to have passed validate_submission)."""
     rows = defaultdict(list)
@@ -153,15 +179,18 @@ def _git(args: list[str], repo) -> str | None:
     return r.stdout.strip() if r.returncode == 0 else None
 
 
-def preflight(path, stems: set[str], twin=None, previous=(), twin_stems: set[str] | None = None, kernels=(),
-              preds: dict | None = None, repo=REPO, rule_json=RULE_JSON, preview: bool = True,
-              img_dir=TEST_IMG) -> dict:
+def preflight(path, stems: set[str], twin=None, previous=None, twin_stems: set[str] | None = None,
+              twin_folds: list[int] | None = None, kernels=(), repo=REPO, preview: bool = True, img_dir=None,
+              subs_dir=None) -> dict:
     """Every automatable check of PROTOCOL 7.3. Values are measurements; res["checks"] maps each check to
     pass/fail and res["passed"] is their conjunction. `near_copy` is True when the file IS a near-copy.
-    twin_stems: images the OOF twin covers (default: every stem of folds.json). preds: the in-memory RLEs,
-    for the decoded-equals-in-memory check (filseg.instances.run does that check itself at write time)."""
-    res, checks = {"path": str(path), "near_copy": None}, {}
-    res["checks"] = checks
+    previous: earlier entry CSVs; None = every earlier entry file of subs_dir (default ../subs), and
+    res["n_previous_compared"] says how many were used (0 gives a warning). Provenance (commit, dirty flag,
+    rule, fold files, in-memory round trip) comes from the sidecar `instances.run` wrote when it built the
+    CSV; a missing sidecar or one for another CSV fails those checks. The image set of the twin is, in this
+    order: twin_stems, the folds in the sidecar of the twin, twin_folds, every fold of folds.json."""
+    res, checks, warnings = {"path": str(path), "near_copy": None}, {}, []
+    res["checks"], res["warnings"] = checks, warnings
     try:
         rows = _scan(path, stems)
         checks["format"] = True
@@ -175,13 +204,32 @@ def preflight(path, stems: set[str], twin=None, previous=(), twin_stems: set[str
     checks["rows_per_image_3_to_12"] = 3 <= res["rows_per_image"] <= 12
     checks["empty_images_at_most_10pct"] = res["empty_image_frac"] <= 0.10
     checks["mask_centres_on_disk"] = not res["off_disk"]
-    if preds is not None:
-        checks["decoded_equals_in_memory"] = roundtrip_equal(path, preds)
+
+    meta = read_meta(path)
+    if meta is None:
+        res["provenance_error"] = f"sidecar {meta_path(path).name} is missing or unreadable"
+    elif meta.get("csv_sha256") != sha256_file(path):
+        res["provenance_error"], meta = "csv sha256 differs from the one recorded in the sidecar", None
+    res["build"] = meta
+    checks["provenance_sidecar"] = meta is not None
+    checks["decoded_equals_in_memory"] = meta is not None and meta.get("roundtrip_equal") is True
+    checks["build_tree_clean"] = meta is not None and meta.get("dirty") is False
+    res["commit"], res["rule_json_sha256"] = (meta or {}).get("commit"), (meta or {}).get("rule_sha256")
+    checks["commit_rule_kernels_recorded"] = bool(
+        meta and meta.get("commit") and meta.get("rule_sha256") and meta.get("files")
+        and all(f.get("meta") or (meta.get("run_meta") or {}).get(f["run"]) for f in meta["files"]))
+    res["kernels"] = list(kernels)
 
     if twin is None:
         checks["twin_given"] = False
     else:
-        ts = twin_stems if twin_stems is not None else set(json.loads(FOLDS_JSON.read_text(encoding="utf-8")))
+        ts, tf = twin_stems, None
+        if ts is None:
+            tm = read_meta(twin)
+            tf = tm["folds"] if tm and tm.get("split") == "oof" and tm.get("folds") else twin_folds
+            allf = json.loads(FOLDS_JSON.read_text(encoding="utf-8"))
+            ts = set(allf) if tf is None else {s for s, f in allf.items() if f in tf}
+        res["twin_folds"], res["twin_images"] = None if tf is None else sorted(tf), len(ts)
         try:
             trows = _scan(twin, ts)
         except ValueError as e:
@@ -194,22 +242,25 @@ def preflight(path, stems: set[str], twin=None, previous=(), twin_stems: set[str
             checks["area_within_30pct_of_twin"] = (abs(res["mean_area"] - res["twin_mean_area"])
                                                    <= 0.3 * res["twin_mean_area"])
 
+    prev = earlier_entries(path, subs_dir or SUBS) if previous is None else [Path(p) for p in previous]
     mine = read_submission(path)
-    res["near_copy_pq"] = {}
-    for p in previous:
+    res["previous_files"], res["near_copy_pq"] = [str(p) for p in prev], {}
+    for p in prev:
         old = read_submission(p)    # the earlier entry plays ground truth; every test image has a record
         res["near_copy_pq"][str(p)] = pq.score({f"x-{s}": old.get(s, []) for s in stems}, mine)["pq"]
+    res["n_previous_compared"] = len(prev)
     res["near_copy"] = any(v >= NEAR_COPY_PQ for v in res["near_copy_pq"].values())
     checks["not_near_copy"] = not res["near_copy"]
+    if not prev:
+        warnings.append("compared against 0 earlier entries: the near-copy check had nothing to compare with")
 
     status = _git(["status", "--porcelain"], repo)
-    res["commit"] = _git(["rev-parse", "HEAD"], repo)
-    res["rule_json_sha256"] = (hashlib.sha256(Path(rule_json).read_bytes()).hexdigest()
-                               if Path(rule_json).is_file() else None)
-    res["kernels"] = list(kernels)
+    res["head"] = _git(["rev-parse", "HEAD"], repo)
     checks["git_tree_clean"] = status == ""
-    checks["commit_rule_kernels_recorded"] = bool(res["commit"] and res["rule_json_sha256"] and res["kernels"])
-    res["preview"] = str(preview_sheet(path, stems, img_dir)) if preview else None
+    if meta and meta.get("commit") and res["head"] and meta["commit"] != res["head"]:
+        warnings.append(f"CSV was built at commit {meta['commit'][:10]} but HEAD is {res['head'][:10]}")
+    out = preview_sheet(path, stems, img_dir or TEST_IMG) if preview else None
+    res["preview"] = None if out is None else str(out)
     res["passed"] = all(checks.values())
     return res
 
@@ -218,16 +269,32 @@ def _main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("csv")
     ap.add_argument("--twin", help="the OOF twin CSV, same code on held-out folds")
-    ap.add_argument("--previous", nargs="*", default=[], help="CSVs of earlier entries (near-copy check)")
-    ap.add_argument("--kernels", nargs="*", default=[], help="kernel versions to record, e.g. filseg-A:v3")
+    ap.add_argument("--twin-folds", nargs="+", type=int,
+                    help="folds the twin covers, when the twin has no sidecar (default: all 5)")
+    ap.add_argument("--previous", nargs="*", default=None,
+                    help="CSVs of earlier entries (near-copy check); default: every s<digit>*.csv in ../subs "
+                         "except this file and *_oof.csv; the option with no value compares with nothing")
+    ap.add_argument("--kernels", nargs="*", default=[], help="free-text note on kernel versions, recorded as given")
     a = ap.parse_args(argv)
     stems = {p.stem for p in TEST_IMG.glob("*.jpeg")}
     if not stems:
         sys.exit(f"no test images under {TEST_IMG}")
-    res = preflight(a.csv, stems, a.twin, a.previous, kernels=a.kernels)
+    res = preflight(a.csv, stems, a.twin, a.previous, twin_folds=a.twin_folds, kernels=a.kernels, img_dir=TEST_IMG)
     for name, ok in res["checks"].items():
-        print(f"{'PASS' if ok else 'FAIL'}  {name}")
-    print(json.dumps({k: v for k, v in res.items() if k != "checks"}, indent=1))
+        warn = name == "not_near_copy" and ok and not res["n_previous_compared"]
+        print(f"{'WARN' if warn else 'PASS' if ok else 'FAIL'}  {name}")
+    if res.get("format_error"):
+        print(f"FAIL  format: {res['format_error']}")
+    if "n_previous_compared" in res:
+        print(f"compared against {res['n_previous_compared']} earlier entries"
+              + "".join(f"\n  {Path(p).name}: PQ {v:.4f}" for p, v in res["near_copy_pq"].items()))
+    for w in res["warnings"]:
+        print(f"WARN  {w}")
+    if res.get("provenance_error"):
+        print(f"FAIL  provenance: {res['provenance_error']}")
+    for r, ks in ((res.get("build") or {}).get("folds_found") or {}).items():
+        print(f"folds averaged, run {r}: {ks}")
+    print(json.dumps({k: v for k, v in res.items() if k not in ("checks", "build", "warnings")}, indent=1))
     side = Path(a.csv).with_name(Path(a.csv).stem + "_preflight.json")
     side.write_text(json.dumps(res, indent=1) + "\n", encoding="utf-8")
     print(f"{'ALL CHECKS PASSED' if res['passed'] else 'PRE-FLIGHT FAILED'}; record {side}; "

@@ -1,4 +1,6 @@
+import json
 import subprocess
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -8,6 +10,12 @@ from pycocotools import mask as mask_util
 
 from filseg import instances as inst
 from filseg import preflight as pf
+from filseg.data import FOLDS_JSON
+
+
+@pytest.fixture(autouse=True)
+def _no_real_subs(tmp_path, monkeypatch):
+    monkeypatch.setattr(pf, "SUBS", tmp_path / "no_subs")       # the default earlier-entries folder is not the real one
 
 
 def test_validator_rejects_overlap(tmp_path):
@@ -126,14 +134,12 @@ def test_preflight_row_count_empty_and_disk_checks(tmp_path):
     assert bad["checks"] == {"format": False} and bad["passed"] is False and "stem" in bad["format_error"]
 
 
-def test_git_and_record_checks(tmp_path):
+def test_git_tree_clean_check(tmp_path):
     inst.write_submission({"s": _rows(4)}, tmp_path / "a.csv")
     repo = tmp_path / "r"; repo.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-    rule = tmp_path / "rule.json"; rule.write_text("{}", encoding="utf-8")
-    kw = dict(preview=False, repo=repo, rule_json=rule, kernels=["k:v1"])
-    c = pf.preflight(tmp_path / "a.csv", {"s"}, **kw)["checks"]
-    assert c["git_tree_clean"] is True and c["commit_rule_kernels_recorded"] is False       # no commit in the new repo yet
+    kw = dict(preview=False, previous=(), repo=repo)
+    assert pf.preflight(tmp_path / "a.csv", {"s"}, **kw)["checks"]["git_tree_clean"] is True
     (repo / "dirty.txt").write_text("x", encoding="utf-8")
     assert pf.preflight(tmp_path / "a.csv", {"s"}, **kw)["checks"]["git_tree_clean"] is False
     assert pf.preflight(tmp_path / "a.csv", {"s"}, **{**kw, "repo": tmp_path / "nowhere"})["checks"]["git_tree_clean"] is False
@@ -150,3 +156,107 @@ def test_preview_sheet(tmp_path):
     assert pf.preview_sheet(tmp_path / "sub.csv", {"no_such_image"}, imgs) is None
     res = pf.preflight(tmp_path / "sub.csv", stems, img_dir=imgs)
     assert res["preview"] == str(out)
+
+
+# ---- fix round 1 (review I1, I2, I3) ----
+
+def test_previous_defaults_to_earlier_entries_in_subs(tmp_path):
+    subs = tmp_path / "subs"; subs.mkdir()
+    for n in ["s1_a.csv", "s2_b.csv", "s3_c_oof.csv", "other.csv", "s_x.csv", "S4_me.csv"]:
+        inst.write_submission({"s": [rect(10, 40, 10, 40)]}, subs / n)
+    res = pf.preflight(subs / "S4_me.csv", {"s"}, preview=False, subs_dir=subs)
+    assert [Path(p).name for p in res["previous_files"]] == ["s1_a.csv", "s2_b.csv"] and res["n_previous_compared"] == 2
+    assert res["near_copy"] is True and res["checks"]["not_near_copy"] is False and res["warnings"] == []
+    none = pf.preflight(subs / "S4_me.csv", {"s"}, preview=False, subs_dir=tmp_path / "empty")
+    assert none["n_previous_compared"] == 0 and any("0 earlier entries" in w for w in none["warnings"])
+    assert pf.preflight(subs / "S4_me.csv", {"s"}, preview=False, previous=(), subs_dir=subs)["n_previous_compared"] == 0
+
+
+def test_cli_states_how_many_earlier_entries_were_compared(tmp_path, monkeypatch, capsys):
+    imgs, subs = tmp_path / "imgs", tmp_path / "subs"; imgs.mkdir(); subs.mkdir()
+    for s in "ab":
+        cv2.imwrite(str(imgs / f"{s}.jpeg"), np.full((2048, 2048), 90, np.uint8))
+    monkeypatch.setattr(pf, "TEST_IMG", imgs); monkeypatch.setattr(pf, "SUBS", subs)
+    inst.write_submission({"a": _rows(4), "b": _rows(4)}, subs / "s2_new.csv")
+    with pytest.raises(SystemExit) as e:
+        pf._main([str(subs / "s2_new.csv")])
+    out = capsys.readouterr().out
+    assert e.value.code == 1 and "compared against 0 earlier entries" in out and "WARN" in out
+    inst.write_submission({"a": _rows(4), "b": _rows(4)}, subs / "s1_old.csv")
+    with pytest.raises(SystemExit):
+        pf._main([str(subs / "s2_new.csv")])
+    out = capsys.readouterr().out
+    assert "compared against 1 earlier entries" in out and "FAIL  not_near_copy" in out and "s1_old.csv" in out
+
+
+@pytest.fixture
+def built(tmp_path, monkeypatch):
+    """A CSV built by instances.run (so with its sidecar) from a 1-fold oof run; git faked as clean."""
+    monkeypatch.setattr(pf, "_git", lambda args, repo: "c0ffee" if args[0] == "rev-parse" else "")
+    blob = np.zeros((2048, 2048), np.uint8); blob[1000:1030, 1000:1030] = 230
+    (tmp_path / "A").mkdir()
+    np.savez(tmp_path / "A" / "oof_fold0.npz", stems=np.array(["has_one", "empty_stem"]), prob=np.stack([blob, np.zeros_like(blob)]))
+    (tmp_path / "A" / "fold0_meta.json").write_text(json.dumps({"commit": "k0", "ok": True}), encoding="utf-8")
+    rule = tmp_path / "rule.json"; rule.write_text(json.dumps({"t_lo": 0.4}), encoding="utf-8")
+    stems = {"has_one", "empty_stem"}
+    inst.run(["A"], "oof", inst.Rule(), tmp_path / "built.csv", tmp_path, stems=stems, rule_file=rule)
+    return tmp_path / "built.csv", stems
+
+
+def _pre(csv, stems, **kw):
+    return pf.preflight(csv, stems, preview=False, previous=(), **kw)
+
+
+def test_provenance_checks_pass_for_a_fresh_build(built):
+    res = _pre(*built)
+    c = res["checks"]
+    assert c["provenance_sidecar"] and c["decoded_equals_in_memory"] and c["build_tree_clean"]
+    assert c["commit_rule_kernels_recorded"] and c["git_tree_clean"]
+    assert res["commit"] == "c0ffee" and res["build"]["folds_found"] == {"A": [0]} and res["build"]["files"][0]["meta"]["commit"] == "k0"
+
+
+def test_provenance_checks_fail_not_vanish(built):
+    csv, stems = built
+    meta = pf.meta_path(csv); good = json.loads(meta.read_text(encoding="utf-8"))
+
+    def with_meta(**kw):
+        meta.write_text(json.dumps({**good, **kw}), encoding="utf-8")
+        return _pre(csv, stems)["checks"]
+    one_file = dict(files=[dict(run="A", file="f", sha256="0", meta=None)])
+    assert with_meta(roundtrip_equal=False)["decoded_equals_in_memory"] is False
+    assert with_meta(dirty=True)["build_tree_clean"] is False
+    assert with_meta(dirty=None)["build_tree_clean"] is False
+    assert with_meta(rule_sha256=None)["commit_rule_kernels_recorded"] is False
+    assert with_meta(commit=None)["commit_rule_kernels_recorded"] is False
+    assert with_meta(run_meta={"A": None}, **one_file)["commit_rule_kernels_recorded"] is False
+    assert with_meta(run_meta={"A": {"commit": "x"}}, **one_file)["commit_rule_kernels_recorded"] is True
+    meta.unlink()
+    res = _pre(csv, stems)
+    c = res["checks"]
+    assert [c[k] for k in ("provenance_sidecar", "decoded_equals_in_memory", "build_tree_clean", "commit_rule_kernels_recorded")] == [False] * 4
+    assert res["passed"] is False and "missing" in res["provenance_error"]
+
+
+def test_provenance_fails_when_the_csv_changed_after_the_build(built):
+    csv, stems = built
+    inst.write_submission({"has_one": [rect(1000, 1031, 1000, 1030)]}, csv)
+    res = _pre(csv, stems)
+    c = res["checks"]
+    assert c["provenance_sidecar"] is False and c["decoded_equals_in_memory"] is False and c["build_tree_clean"] is False
+    assert "sha256" in res["provenance_error"]
+
+
+def test_twin_stems_come_from_the_twin_sidecar_then_the_option(tmp_path):
+    folds = json.loads(FOLDS_JSON.read_text(encoding="utf-8"))
+    fold0 = sorted(s for s, f in folds.items() if f == 0)
+    inst.write_submission({"s": _rows(4)}, tmp_path / "a.csv")
+    inst.write_submission({s: [rect(1000, 1010, 1000, 1010)] for s in fold0}, tmp_path / "twin.csv")   # 1 row per fold-0 image
+    kw = dict(twin=tmp_path / "twin.csv", preview=False, previous=())
+    allf = pf.preflight(tmp_path / "a.csv", {"s"}, **kw)
+    assert allf["twin_images"] == len(folds) and allf["checks"]["rows_within_20pct_of_twin"] is False
+    opt = pf.preflight(tmp_path / "a.csv", {"s"}, twin_folds=[0], **kw)
+    assert opt["twin_images"] == len(fold0) and opt["twin_rows_per_image"] == 1.0
+    pf.meta_path(tmp_path / "twin.csv").write_text(json.dumps({"split": "oof", "folds": [0]}), encoding="utf-8")
+    side = pf.preflight(tmp_path / "a.csv", {"s"}, **kw)
+    assert side["twin_images"] == len(fold0) and side["twin_folds"] == [0]
+    assert pf.preflight(tmp_path / "a.csv", {"s"}, twin_folds=[1], **kw)["twin_images"] == len(fold0)      # sidecar first
