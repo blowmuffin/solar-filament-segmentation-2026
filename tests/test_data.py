@@ -53,17 +53,54 @@ def test_normalize_at_both_resolutions():
         assert abs(inside.mean()) < 1e-3 and abs(inside.std() - 1) < 1e-3
 
 
-def test_build_cache_layout_and_scale(tmp_path, monkeypatch):    # two stems, 256 px: fast stand-in for the full cache
+def test_committed_folds_are_pinned():           # the frozen file must not drift from make_folds (numpy upgrade, edit)
+    n = {s: len(r) for s, r in D.load_records().items()}
+    pairs = json.loads(D.FOLDS_JSON.read_text(encoding="utf-8"), object_pairs_hook=list)
+    assert sorted(s for s, _ in pairs) == sorted(n)           # every stem exactly once
+    assert dict(pairs) == D.make_folds(n)
+
+
+def test_folds_cli_refuses_overwrite(tmp_path, monkeypatch):
+    monkeypatch.setattr(D, "FOLDS_JSON", tmp_path / "folds.json")
+    D._main(["folds"])
+    first = D.FOLDS_JSON.read_bytes()
+    D.FOLDS_JSON.write_bytes(b"{}")
+    try:
+        D._main(["folds"])
+        raise AssertionError("overwrote an existing folds.json without --force")
+    except SystemExit:
+        assert D.FOLDS_JSON.read_bytes() == b"{}"
+    D._main(["folds", "--force"])
+    assert D.FOLDS_JSON.read_bytes() == first
+
+
+def test_mask_orientation_row_is_y_col_is_x():   # a transposed or flipped mask puts the centroid hundreds of px away
+    coco = json.loads(D.TRAIN_JSON.read_text(encoding="utf-8"))
+    rid = "040301-20140609195854Bh"
+    poly = np.array(next(a for a in coco["annotations"] if a["image_id"] == rid)["segmentation"][0]).reshape(-1, 2)
+    rows, cols = np.nonzero(mask_util.decode(D.load_records()["20140609195854Bh"][rid][0]))
+    assert abs(rows.mean() - poly[:, 1].mean()) < 5 and abs(cols.mean() - poly[:, 0].mean()) < 5
+    assert abs(poly[:, 1].mean() - poly[:, 0].mean()) > 100   # the filament is off the diagonal, so the check can tell
+
+
+def test_build_cache_alignment_and_orientation(tmp_path):      # 3 stems at 1024 px: stand-in for the full cache
     recs = D.load_records()
-    stems = sorted(s for s, r in recs.items() if len(r) == 3)[:2]
-    monkeypatch.setattr(D, "load_records", lambda: {s: recs[s] for s in stems})
-    D.build_cache(tmp_path, 256)
+    stems = sorted(s for s, r in recs.items() if len(r) == 3)[:3]
+    D.build_cache(tmp_path, 1024, stems=stems)
     assert json.loads((tmp_path / "stems.json").read_text(encoding="utf-8")) == stems
-    img = np.memmap(tmp_path / "img_256.u8", np.uint8, "r", shape=(2, 256, 256))
-    soft = np.memmap(tmp_path / "soft_256.u8", np.uint8, "r", shape=(2, 256, 256))
-    want = cv2.resize(D.load_image(D.TRAIN_IMG / f"{stems[1]}.jpeg"), (256, 256), interpolation=cv2.INTER_AREA)
-    assert (img[1] == want).all()
-    assert abs(soft[0].mean() / 255 - D.soft_target(recs[stems[0]]).mean()) < 1e-3   # area resize keeps the mean
+    img = np.memmap(tmp_path / "img_1024.u8", np.uint8, "r", shape=(3, 1024, 1024))
+    soft = np.memmap(tmp_path / "soft_1024.u8", np.uint8, "r", shape=(3, 1024, 1024))
+    disk = D._disk_masks(1024)[0]
+    for i, s in enumerate(stems):
+        want_img = cv2.resize(D.load_image(D.TRAIN_IMG / f"{s}.jpeg"), (1024, 1024), interpolation=cv2.INTER_AREA)
+        want_soft = np.round(cv2.resize(D.soft_target(recs[s]), (1024, 1024), interpolation=cv2.INTER_AREA) * 255)
+        assert (img[i] == want_img).all() and (soft[i] == want_soft.astype(np.uint8)).all()
+        # filaments are dark in H-alpha: under the soft target the image is below the disk median, and darker
+        # than under the same target transposed or flipped (a misaligned target fails this)
+        on = soft[i] > 127
+        assert img[i][on].mean() < np.median(img[i][disk])
+        for bad in (on.T, on[::-1], on[:, ::-1]):
+            assert img[i][on].mean() < img[i][bad].mean() - 5
     del img, soft
 
 

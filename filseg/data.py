@@ -18,7 +18,7 @@ TRAIN_JSON_NAME = "MAGFiLO_1.0_Annotations_kaggle2026_train.json"
 REPO = Path(__file__).resolve().parent.parent
 FOLDS_JSON = Path(__file__).resolve().parent / "folds.json"
 KAGGLE_INPUT = Path("/kaggle/input")
-ON_KAGGLE = KAGGLE_INPUT.is_dir()
+ON_KAGGLE = os.name != "nt" and KAGGLE_INPUT.is_dir()    # "/kaggle/input" is drive-relative on Windows
 
 
 def _data_root() -> Path:
@@ -105,12 +105,13 @@ def make_folds(n_records: dict[str, int], k: int = 5, seed: int = 0) -> dict[str
     return {s: i % k for i, s in enumerate(order)}
 
 
-def build_cache(out_dir, work_res: int) -> None:
-    """img_<res>.u8 and soft_<res>.u8, raw uint8 (n, res, res) in stems.json order (np.memmap-ready)."""
+def build_cache(out_dir, work_res: int, stems: list[str] | None = None) -> None:
+    """img_<res>.u8 and soft_<res>.u8, raw uint8 (n, res, res) in stems.json order (np.memmap-ready).
+    stems: default all, sorted; a subset is for tests."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     recs = load_records()
-    stems = sorted(recs)
+    stems = sorted(recs) if stems is None else list(stems)
     shape = (len(stems), work_res, work_res)
     img_mm = np.memmap(out / f"img_{work_res}.u8", np.uint8, "w+", shape=shape)
     soft_mm = np.memmap(out / f"soft_{work_res}.u8", np.uint8, "w+", shape=shape)
@@ -169,14 +170,16 @@ def disk_check() -> dict:
 
 
 def _main(argv: list[str]) -> None:
-    if argv == ["folds"]:
+    if argv[:1] == ["folds"] and argv[1:] in ([], ["--force"]):
+        if FOLDS_JSON.exists() and argv[1:] != ["--force"]:
+            sys.exit(f"{FOLDS_JSON} exists and the folds are frozen; pass --force to overwrite it")
         n = {s: len(r) for s, r in load_records().items()}
         FOLDS_JSON.write_text(json.dumps(make_folds(n), indent=1, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
         print(f"wrote {FOLDS_JSON}")
     elif argv == ["diskcheck"]:
         print(json.dumps(disk_check(), indent=1))
     else:
-        sys.exit("usage: python -m filseg.data folds | diskcheck")
+        sys.exit("usage: python -m filseg.data folds [--force] | diskcheck")
 
 
 if __name__ == "__main__":
