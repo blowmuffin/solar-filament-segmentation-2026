@@ -1,6 +1,7 @@
 """Inference from the committed weights: the weights manifest, the ensemble probability map, one image to masks.
 
-`python -m filseg.infer --run A --out weights` copies <run>/fold<k>.pt into weights/ and writes weights/manifest.json."""
+`python -m filseg.infer --run AF --folds 5 --tag final1 --out weights` copies <run>/fold<k>.pt into weights/ and adds it
+to weights/manifest.json; the notebook picks ONE entry by its `final` tag (final1 or final2), it never averages."""
 import argparse
 import json
 import shutil
@@ -30,14 +31,17 @@ class Segmentation(NamedTuple):
     rles: list[dict]        # one column-major RLE per kept component, in `kept` order
 
 
-def make_manifest(runs: list[str], out_dir, folds=(0, 1, 2, 3, 4), runs_root=None) -> dict:
-    """Copy <runs_root>/<run>/fold<k>.pt to <out_dir>/<run>_fold<k>.pt for every run and fold and write
-    <out_dir>/manifest.json: {"models": [{file, run, fold, encoder, work_res, sha256, commit}]}. The encoder and
+def make_manifest(runs: list[str], out_dir, folds=(0, 1, 2, 3, 4), runs_root=None, tag=None) -> dict:
+    """Copy <runs_root>/<run>/fold<k>.pt to <out_dir>/<run>_fold<k>.pt for every run and fold and add them to
+    <out_dir>/manifest.json: {"models": [{file, run, fold, encoder, work_res, sha256, commit, final}]}. An existing
+    manifest is kept: entries of the same file are replaced, the others stay. `tag` ("final1", "final2") is stored as
+    `final` (null without it) and taken from any other entry, so a tag names one file. The encoder and
     work_res come from the config the job recorded next to the weights (fold<k>_meta.json), else from
     configs/runs.json. runs_root default: model.run_dir (FILSEG_RUNS, else ../runs)."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    models = []
+    old = out / MANIFEST
+    models = json.loads(old.read_text(encoding="utf-8"))["models"] if old.exists() else []
     for run in runs:
         src = Path(runs_root) / run if runs_root else run_dir(run)
         for k in folds:
@@ -52,17 +56,19 @@ def make_manifest(runs: list[str], out_dir, folds=(0, 1, 2, 3, 4), runs_root=Non
             if size >= MAX_FILE_BYTES:
                 dst.unlink()
                 raise ValueError(f"{src / f'fold{k}.pt'} is {size / 1e6:.0f} MB, the limit is 100 MB")
+            models = [{**m, "final": None} if tag and m.get("final") == tag else m for m in models if m["file"] != dst.name]
             models.append(dict(file=dst.name, run=run, fold=k, encoder=cfg["encoder"], work_res=cfg["work_res"],
-                               sha256=sha256_file(dst), commit=meta.get("commit")))
+                               sha256=sha256_file(dst), commit=meta.get("commit"), final=tag))
     manifest = {"models": models}
     (out / MANIFEST).write_text(json.dumps(manifest, indent=1) + "\n", encoding="utf-8", newline="\n")
     return manifest
 
 
-def load_models(weights_dir, device: str = "cpu") -> list[tuple[dict, torch.nn.Module]]:
-    """(manifest entry, float32 eval-mode model on `device`) for every model of <weights_dir>/manifest.json.
-    A relative weights_dir is taken from the repo root. Each file's SHA-256 and encoder are checked against
-    the manifest; nothing is downloaded."""
+def load_models(weights_dir, device: str = "cpu", tag=None) -> list[tuple[dict, torch.nn.Module]]:
+    """(manifest entry, float32 eval-mode model on `device`) for every model of <weights_dir>/manifest.json, or with
+    `tag` for the one entry whose `final` is that tag (the other files need not exist). A relative weights_dir is
+    taken from the repo root. Each loaded file's SHA-256 and encoder are checked against the manifest; nothing is
+    downloaded."""
     wdir = D.REPO / weights_dir
     manifest = wdir / MANIFEST
     if not manifest.exists():
@@ -70,6 +76,10 @@ def load_models(weights_dir, device: str = "cpu") -> list[tuple[dict, torch.nn.M
     entries = json.loads(manifest.read_text(encoding="utf-8"))["models"]
     if not entries:
         raise ValueError(f"{manifest} lists no models")
+    if tag is not None:
+        entries = [e for e in entries if e.get("final") == tag]
+        if len(entries) != 1:
+            raise ValueError(f"{manifest} has {len(entries)} models tagged {tag!r}, expected exactly one")
     members = []
     for e in entries:
         path = wdir / e["file"]
@@ -110,11 +120,12 @@ def main(argv=None) -> None:
     ap.add_argument("--run", nargs="+", required=True)
     ap.add_argument("--folds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
     ap.add_argument("--runs-root", help="folder holding <run>/fold<k>.pt (default: FILSEG_RUNS, else ../runs)")
+    ap.add_argument("--tag", help="final1 or final2: mark these files in the manifest (notebook setting MODEL)")
     ap.add_argument("--out", default="weights", help="destination, relative to the repo root")
     a = ap.parse_args(argv)
-    manifest = make_manifest(a.run, D.REPO / a.out, a.folds, a.runs_root)
+    manifest = make_manifest(a.run, D.REPO / a.out, a.folds, a.runs_root, a.tag)
     for e in manifest["models"]:
-        print(f"{e['file']}: run {e['run']} fold {e['fold']} {e['encoder']} work_res {e['work_res']} sha256 {e['sha256'][:12]}")
+        print(f"{e['file']}: run {e['run']} fold {e['fold']} {e['encoder']} work_res {e['work_res']} final {e['final']} sha256 {e['sha256'][:12]}")
     print(f"wrote {D.REPO / a.out / MANIFEST} ({len(manifest['models'])} models)")
 
 

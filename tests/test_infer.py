@@ -90,3 +90,22 @@ def test_load_rule_roundtrip(tmp_path):
     rule = Rule(t_lo=0.35, peak=0.9, mean=0.6, min_area=300, max_r=0.95)
     (tmp_path / "rule.json").write_text(json.dumps(asdict(rule)), encoding="utf-8")
     assert infer.load_rule(tmp_path / "rule.json") == rule
+
+
+def test_final_tags_select_one_model(tmp_path):
+    """Two tagged runs in one manifest (fold 5 = all stems for AF); load_models(tag=) loads only the named file."""
+    runs, out = tmp_path / "runs", tmp_path / "weights"
+    cfg = {"encoder": "resnet18", "work_res": 128}
+    _fake_run(runs, "AF", 5, cfg=cfg); _fake_run(runs, "A", 0, cfg=cfg)
+    infer.make_manifest(["A"], out, [0], runs, tag="final2")
+    man = infer.make_manifest(["AF"], out, [5], runs, tag="final1")      # adds to the manifest, keeps final2
+    assert {e["file"]: e["final"] for e in man["models"]} == {"A_fold0.pt": "final2", "AF_fold5.pt": "final1"}
+    (e, _), = infer.load_models(out, tag="final1")
+    assert (e["run"], e["fold"]) == ("AF", 5)
+    (out / "A_fold0.pt").unlink()                                        # the untagged file is not needed
+    with pytest.raises(FileNotFoundError): infer.load_models(out, tag="final2")
+    (e, _), = infer.load_models(out, tag="final1")
+    with pytest.raises(ValueError, match="exactly one"): infer.load_models(out, tag="final3")
+    infer.make_manifest(["A"], out, [0], runs, tag="final1")             # a tag moves to the new file
+    assert {e["file"]: e["final"] for e in json.loads((out / "manifest.json").read_text(encoding="utf-8"))["models"]} == {
+        "A_fold0.pt": "final1", "AF_fold5.pt": None}

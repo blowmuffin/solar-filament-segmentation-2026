@@ -1,32 +1,39 @@
 # filseg: solar filament instance segmentation
 
-Our solution to the *Solar Filament Segmentation Challenge 2026* (Kaggle competition `filament-segmentation-2026`, metric: Panoptic Quality, PQ). A U-Net predicts where filaments are; the connected pieces of its probability map become the instances; a small keep rule discards the weak ones. The repository holds the training code, the inference code, the final weights and one notebook that rebuilds the submission file from the weights without any training.
+Our solution to the *Solar Filament Segmentation Challenge 2026* (Kaggle competition `filament-segmentation-2026`, metric: Panoptic Quality, PQ). A U-Net predicts where filaments are; the connected pieces of its probability map become the instances; a small keep rule discards the weak ones. The repository holds the training code, the inference code, the final weights and one notebook that rebuilds the submission file from one set of weights without any training.
 
 Author: Ayush Kasare. Licence: MIT (`LICENSE`).
 
+## The final model
+
+The default submission (`MODEL = "final1"` in the notebook, file `weights/AF_fold5.pt`) is **one** U-Net (ResNet34, one input channel, 2048 px) trained on all 707 training images (run `AF`; fold index 5 means "every image"), followed by the keep rule in `filseg/rule.json`. A second entry, `final2` (`weights/A_fold0.pt`, submitted as entry S1), is the model of run `A` fold 0, trained on four of the five folds, with the same rule. We use one model and not an average of several because averaging was tested and did not help: averaging models lowered the PQ on fold 0, and the keep rule was tuned on single-model maps, whose probabilities are sharper than those of an average. The final model also sees 25 % more images than any fold model. The cost is that it has no held-out images of its own: its quality is estimated from the five fold models of the same recipe (run `A`), which is what the table reports.
+
 ## Results
 
-Everything marked `TBD` is filled in from the final runs. PQ is the host's pooled Panoptic Quality: predicted and true filaments match at IoU above 0.5, `PQ = sum of IoU over matches / (TP + FP/2 + FN/2)`, `SQ` is the mean IoU of the matches and `RQ = TP / (TP + FP/2 + FN/2)`. The out-of-fold numbers come from the five-fold split below, with the keep rule of every fold tuned on the other four folds only (nested). Intervals are 95 % bootstrap intervals over images (2000 resamples, `filseg.tune.bootstrap_ci`).
+PQ is the host's pooled Panoptic Quality: predicted and true filaments match at IoU above 0.5, `PQ = sum of IoU over matches / (TP + FP/2 + FN/2)`, `SQ` is the mean IoU of the matches and `RQ = TP / (TP + FP/2 + FN/2)`. The out-of-fold (OOF) numbers come from the five-fold split below; the keep rule of every fold is tuned on the other four folds only (nested), so the number is not inflated by the tuning. Intervals are 95 % bootstrap intervals over images (2000 resamples, `filseg.tune.bootstrap_ci`), 707 images.
+
+| quantity (all 707 training images, out-of-fold) | PQ | SQ | RQ |
+|---|---|---|---|
+| Fold models of run `A` + keep rule, nested (estimate for the final model) | **0.4483** (95 % interval 0.4394 to 0.4576) | 0.684 | 0.656 |
+| Same maps, plain threshold 0.5 + connected components, no keep rule | 0.3475 (0.3389 to 0.3556) | | |
+| Gain of the keep rule, paired bootstrap | +0.1008 (all resamples above zero) | | |
+| No-training baseline (`filseg/baseline.py`: dark structure on a brighter neighbourhood, tuned rule) | 0.0319 (0.0263 to 0.0378) | | |
+| One annotator scored against another (agreement reference) | 0.3399 | | |
+
+Matches, false positives and false negatives of the nested row: 5261, 2589, 2938.
 
 | quantity | value |
 |---|---|
-| Out-of-fold PQ, nested, final submission | TBD (95 % interval TBD to TBD) |
-| Out-of-fold SQ / RQ | TBD / TBD |
-| No-training baseline (`filseg/baseline.py`), same protocol | TBD (95 % interval TBD to TBD) |
-| Gain over the baseline, paired bootstrap | TBD (95 % interval TBD to TBD) |
-| Kaggle public leaderboard PQ | TBD |
-| Kaggle private leaderboard PQ | TBD |
-| Working resolution (`work_res`, decided by a pilot) | TBD px |
-| Reproduction: PQ of the notebook's CSV against the submitted CSV (target at least 0.99) | TBD on a T4, TBD on a CPU |
-| Notebook run time, 180 test images | TBD min on a T4, TBD min on a CPU |
-| Size of one weight file | TBD MB (fp16) |
+| Kaggle public leaderboard PQ, entry S1 (`final2`) | TBD |
+| Working resolution (`work_res`, decided by a pilot) | 2048 px |
+| Size of one weight file | 49 MB (fp16) |
 
 ## The pipeline in six lines
 
 1. **Normalise.** Each image is z-scored with the mean and standard deviation of the pixels inside 0.98 of the solar radius; the sky outside the disk is set to 0.
 2. **Network.** A U-Net with a ResNet34 encoder (ImageNet initialisation, one input channel) predicts one probability per pixel.
-3. **Training.** The target is the mean of all annotators' masks of the image (a soft target), the loss is binary cross-entropy plus 0.5 times soft Dice, the inputs are 512 px crops (70 % of them centred on a filament) with flips, quarter turns and a small brightness jitter. AdamW, one warm-up epoch then cosine decay, 40 epochs of 250 steps, weights averaged over time (EMA). One model per fold, five folds, trained on Kaggle T4 GPUs.
-4. **Predict.** Each test image is predicted whole at the working resolution, in four views (as is, left-right, up-down, both) that are flipped back and averaged, then averaged over the five fold models and brought to 2048 px.
+3. **Training.** The target is the mean of all annotators' masks of the image (a soft target), the loss is binary cross-entropy plus 0.5 times soft Dice, the inputs are 512 px crops (70 % of them centred on a filament) with flips, quarter turns and a small brightness jitter. AdamW, one warm-up epoch then cosine decay, 40 epochs of 250 steps, weights averaged over time (EMA). One model per fold (five folds, run `A`, for the out-of-fold maps and the keep rule) and one model on all images (run `AF`, the final model), trained on Kaggle T4 GPUs.
+4. **Predict.** Each test image is predicted whole by the one chosen model at the working resolution, in four views (as is, left-right, up-down, both) that are flipped back and averaged, and brought to 2048 px.
 5. **Instances.** The 8-connected components of the probability map above a low threshold are the candidates. A keep rule (peak and mean probability, area, and a limb cut on the distance from the disk centre as a fraction of the solar radius) discards weak candidates. The rule is tuned by nested five-fold cross-validation on the host-exact pooled PQ.
 6. **Output.** The kept components become pixel-disjoint column-major RLE rows `<image stem>_<k>`, and the file is validated before it is written out.
 
@@ -41,7 +48,7 @@ Everything marked `TBD` is filled in from the final runs. PQ is the host's poole
 | `filseg/train.py` | Trains one fold: samples crops, computes the loss, keeps the EMA weights, saves them in fp16. Needs a GPU. |
 | `filseg/predict.py` | Probability map of one image from flip views; its command-line entry predicts a fold's validation images and all test images on a GPU. |
 | `filseg/job.py`, `tools/make_kernel.py` | Run fold jobs on Kaggle's two T4 GPUs; build the Kaggle notebook that carries the code (it refuses a modified git tree and records the commit). |
-| `filseg/infer.py` | Reads `weights/manifest.json`, checks the weight files, builds the ensemble map and turns one image into masks; also writes the manifest. What the notebook calls. |
+| `filseg/infer.py` | Reads `weights/manifest.json`, picks the model tagged `final1` or `final2`, checks its file and turns one image into masks; also writes the manifest. What the notebook calls. |
 | `filseg/instances.py` | Components of a probability map, their features, the keep rule, RLE encoding, the CSV writer; its command-line entry builds a CSV from the prediction files of a run. |
 | `filseg/preflight.py` | Submission checker (format, overlaps, row counts), pre-submission checks, preview sheet. |
 | `filseg/pq.py` | The competition metric, re-implemented and checked against the host's own scorer. |
@@ -50,18 +57,18 @@ Everything marked `TBD` is filled in from the final runs. PQ is the host's poole
 | `filseg/eda.py` | Data checks: site and year mix, train-test drift, annotator agreement, filament geometry. |
 | `filseg/folds.json` | The frozen assignment of every training image to a fold. |
 | `filseg/rule.json` | The final keep rule. |
-| `weights/` | The final fp16 weights, one file per fold, and `manifest.json`. |
+| `weights/` | The two final fp16 weight files (`AF_fold5.pt`, `A_fold0.pt`) and `manifest.json`. |
 | `tests/` | One test file per module (`python -m pytest tests -q`). |
 
 ## Reproduce the submission
 
-The notebook needs the test images, `weights/` and `filseg/rule.json`; nothing else. With the annotation file also present it scores one training fold at the end.
+The notebook needs the test images, `weights/` and `filseg/rule.json`; nothing else. With the annotation file also present it scores fold 0 out-of-fold at the end (with the fold-0 model, `final2`). It writes `submission.csv`.
 
-Settings are at the top of the notebook (`DATA_DIR`, `N_IMAGES`, `RUN_TRAINING`). Four environment variables can set the same things before launch: `FILSEG_DATA` (folder that holds `test/test_images` and, optionally, `train/`), `FILSEG_WEIGHTS` (default `weights`), `FILSEG_RULE` (default `filseg/rule.json`), `FILSEG_OUT` (where `submission.csv` is written, default the current folder). Relative paths are taken from the repository root.
+Settings are at the top of the notebook: `MODEL` (`"final1"`, the default, or `"final2"`), `N_IMAGES` (`None` = all test images), `DATA_DIR`, `DEVICE` (GPU if there is one) and `RUN_TRAINING` (`False`). Environment variables can set the same things before launch: `FILSEG_N_IMAGES`, `FILSEG_DATA` (folder that holds `test/test_images` and, optionally, `train/`), `FILSEG_WEIGHTS` (default `weights`), `FILSEG_RULE` (default `filseg/rule.json`), `FILSEG_OUT` (where `submission.csv` is written, default the current folder). Relative paths are taken from the repository root.
 
 **On Kaggle**
 
-1. Create a notebook, switch the accelerator to a T4 GPU (a CPU works, slower) and add the competition data as an input; the notebook finds it under `/kaggle/input`.
+1. Create a notebook, switch the accelerator to a T4 GPU (a CPU works, much slower) and attach the competition data as an input; the notebook finds it under `/kaggle/input`.
 2. Get the repository: `!git clone <URL of this repository>` and `%cd` into it, or attach it as a dataset.
 3. `!pip install -q segmentation-models-pytorch==0.6.0 pycocotools==2.0.11` (the Kaggle image already has the other packages).
 4. Run `notebook.ipynb`, or headless: `!FILSEG_OUT=/kaggle/working jupyter nbconvert --to notebook --execute notebook.ipynb --output-dir /kaggle/working`. The result is `submission.csv`.
@@ -77,35 +84,37 @@ export FILSEG_DATA=/path/to/MAGFiLO_1.0_Kaggle_2026       # the folder that hold
 jupyter lab notebook.ipynb
 ```
 
-For a quick check on a machine without a GPU, set `N_IMAGES = 2` in the settings cell: it runs top to bottom in a few minutes. The notebook picks the GPU if there is one and falls back to the CPU. The two give nearly the same probability maps (the GPU runs the network in fp16 mixed precision, the CPU in fp32), so a component right at a threshold can differ; the reproduction row in the results table measures this.
+**Run time.** On a T4 the notebook takes about 1 s per image at 2048 px (four flip views of one model), so the 180 test images take a few minutes plus start-up. On a CPU it is much slower: about 17 s per image on our laptop CPU, which is why a smoke run uses `FILSEG_N_IMAGES=2` (about a minute and a half in total, scoring included). The GPU runs the network in fp16 mixed precision and the CPU in fp32, so the probability maps are nearly but not exactly equal and a component right at a threshold can differ between the two.
 
 ## Weights and keep rule
 
-`weights/manifest.json` lists the models the notebook loads, so the notebook needs no knowledge of file names or resolutions:
+`weights/manifest.json` lists the two committed models; the notebook selects one by its `final` tag (`MODEL = "final1"` or `"final2"`), so it needs no knowledge of file names or resolutions, and it never averages models:
 
 ```json
-{"models": [{"file": "A_fold0.pt", "run": "A", "fold": 0, "encoder": "resnet34",
-             "work_res": 2048, "sha256": "...", "commit": "..."}, ...]}
+{"models": [{"file": "AF_fold5.pt", "run": "AF", "fold": 5, "encoder": "resnet34",
+             "work_res": 2048, "sha256": "...", "commit": "...", "final": "final1"},
+            {"file": "A_fold0.pt", "run": "A", "fold": 0, "encoder": "resnet34",
+             "work_res": 2048, "sha256": "...", "commit": "...", "final": "final2"}]}
 ```
 
-`work_res` is the resolution the model was trained and predicts at (the image is area-resized to it and the map is brought back to 2048 px); `commit` is the code version that trained it. The weight files are fp16 `state_dict`s, each under 100 MB; `infer.load_models` checks every file against its SHA-256 and never downloads anything (the ImageNet initialisation is only needed for training and is overwritten by the trained weights). All models of the manifest are averaged with equal weight, exactly as `instances.py` averages the prediction files of a run, so the notebook and the command line build the same CSV from the same models.
+`work_res` is the resolution the model was trained and predicts at (the image is area-resized to it and the map is brought back to 2048 px); `commit` is the code version that trained it. The weight files are fp16 `state_dict`s of 49 MB each (under GitHub's 100 MB file limit); `infer.load_models` checks the chosen file against its SHA-256 and never downloads anything (the ImageNet initialisation is only needed for training and is overwritten by the trained weights).
 
-`filseg/rule.json` is the keep rule written by `filseg.tune`: `t_lo` (component threshold), `peak` and `mean` (minimum peak and mean probability inside the component), `min_area` (pixels at 2048 px), `max_r` (largest allowed distance of the component centre from the disk centre, as a fraction of the solar radius).
+`filseg/rule.json` is the keep rule written by `filseg.tune`, the same for both models: `t_lo` 0.5 (component threshold), `peak` 0.99 and `mean` 0.9 (minimum peak and mean probability inside the component), `min_area` 200 (pixels at 2048 px), `max_r` 0.9 (largest allowed distance of the component centre from the disk centre, as a fraction of the solar radius).
 
 ## Retrain on Kaggle
 
-Training runs on Kaggle's two T4 GPUs, one fold per GPU, so five folds take three kernels (folds 0 and 1, 2 and 3, 4). You need a Kaggle account with the competition rules accepted and the Kaggle CLI (`python -m kaggle`); change `OWNER` in `tools/make_kernel.py` to your user name. Run from the repository root, with a clean git tree (the builder refuses a modified one so that every run records one commit):
+Training runs on Kaggle's two T4 GPUs, one job per GPU (about an hour per job at 2048 px). The five fold jobs of run `A` give the out-of-fold maps for the keep rule; job `AF:5` trains the final model on all images. You need a Kaggle account with the competition rules accepted and the Kaggle CLI (`python -m kaggle`); change `OWNER` in `tools/make_kernel.py` to your user name. Run from the repository root, with a clean git tree (the builder refuses a modified one so that every run records one commit):
 
 ```
 python tools/make_kernel.py --job retrain-a --jobs A:0 A:1
 python -m kaggle kernels push -p ../kaggle/retrain-a --accelerator NvidiaTeslaT4 -t 14400
 python tools/make_kernel.py --job retrain-b --jobs A:2 A:3
 python -m kaggle kernels push -p ../kaggle/retrain-b --accelerator NvidiaTeslaT4 -t 14400
-python tools/make_kernel.py --job retrain-c --jobs A:4
+python tools/make_kernel.py --job retrain-c --jobs A:4 AF:5
 python -m kaggle kernels push -p ../kaggle/retrain-c --accelerator NvidiaTeslaT4 -t 14400
 ```
 
-`A` is a run name from `configs/runs.json` (`A` is the default setting at 2048 px, `B` the same at 1024 px). Each kernel builds the training cache, trains, and predicts the fold's validation images and the test images. When a kernel has finished (`python -m kaggle kernels status <owner>/filseg-retrain-a`), download its files into `../runs` so that `../runs/A/fold<k>.pt` exists:
+`A` and `AF` are run names from `configs/runs.json` (the same recipe at 2048 px; `AF` is trained on all images, fold index 5). Each job builds the training cache, trains, and predicts the validation images (for `AF:5`, nothing is held out) and the test images. When a kernel has finished (`python -m kaggle kernels status <owner>/filseg-retrain-a`), download its files into `../runs` so that `../runs/A/fold<k>.pt` and `../runs/AF/fold5.pt` exist:
 
 ```
 python -m kaggle kernels output <owner>/filseg-retrain-a -p ../runs --file-pattern <pattern>
@@ -114,12 +123,12 @@ python -m kaggle kernels output <owner>/filseg-retrain-a -p ../runs --file-patte
 Then, from the repository root:
 
 ```
-python -m filseg.tune --run A --rule-out filseg/rule.json     # tune the keep rule on the out-of-fold maps
-python -m filseg.infer --run A --out weights                  # copy the fold weights, write weights/manifest.json
-python -m filseg.instances --run A --split test --rule filseg/rule.json --out submission.csv
+python -m filseg.tune --run A --rule-out filseg/rule.json                   # tune the keep rule on the out-of-fold maps
+python -m filseg.infer --run AF --folds 5 --tag final1 --out weights        # copy the weights, add them to weights/manifest.json
+python -m filseg.infer --run A --folds 0 --tag final2 --out weights
 ```
 
-The last command builds the CSV from the saved test maps instead of re-running the networks; the notebook builds it from the weights. The notebook's last cell prints the same training commands and can run them on a machine with GPUs (`RUN_TRAINING = True`).
+The notebook's last cell prints the same training commands and can run them on a machine with GPUs (`RUN_TRAINING = True`).
 
 ## The split
 

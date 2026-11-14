@@ -1,0 +1,14 @@
+{
+ "models": [
+  {
+   "file": "A_fold0.pt",
+   "run": "A",
+   "fold": 0,
+   "encoder": "resnet34",
+   "work_res": 2048,
+   "sha256": "47bc40676210579bac4927036135f75f533fe562c1fe3dd32e2ec5ecac87bdef",
+   "commit": "56662c5695400cc383be7728b1985da8a8350e60",
+   "final": "final2"
+  }
+ ]
+}
