@@ -10,6 +10,16 @@
    "commit": "56662c5695400cc383be7728b1985da8a8350e60",
    "final": "final2",
    "rule": "filseg/rule_fold0.json"
+  },
+  {
+   "file": "AF_fold5.pt",
+   "run": "AF",
+   "fold": 5,
+   "encoder": "resnet34",
+   "work_res": 2048,
+   "sha256": "9069afd582e183b9deef52143a55457ddf93b0e718d33d2eb0fa48a63aadd8ee",
+   "commit": "947ed8566d304c560e8734fce5eca2106bcc5da0",
+   "final": "final1"
   }
  ]
 }
