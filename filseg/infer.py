@@ -31,13 +31,16 @@ class Segmentation(NamedTuple):
     rles: list[dict]        # one column-major RLE per kept component, in `kept` order
 
 
-def make_manifest(runs: list[str], out_dir, folds=(0, 1, 2, 3, 4), runs_root=None, tag=None) -> dict:
+def make_manifest(runs: list[str], out_dir, folds=(0, 1, 2, 3, 4), runs_root=None, tag=None, rule=None) -> dict:
     """Copy <runs_root>/<run>/fold<k>.pt to <out_dir>/<run>_fold<k>.pt for every run and fold and add them to
     <out_dir>/manifest.json: {"models": [{file, run, fold, encoder, work_res, sha256, commit, final}]}. An existing
-    manifest is kept: entries of the same file are replaced, the others stay. `tag` ("final1", "final2") is stored as
+    manifest is kept: entries of the same file are replaced, the others stay. `rule` (repo-relative path of a keep rule,
+    must exist) is stored as `rule` on the new entries and the notebook then uses it for that model. `tag` ("final1", "final2") is stored as
     `final` (null without it) and taken from any other entry, so a tag names one file. The encoder and
     work_res come from the config the job recorded next to the weights (fold<k>_meta.json), else from
     configs/runs.json. runs_root default: model.run_dir (FILSEG_RUNS, else ../runs)."""
+    if rule and not (D.REPO / rule).is_file():
+        raise FileNotFoundError(f"{D.REPO / rule}: the keep rule of the manifest entry does not exist")
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     old = out / MANIFEST
@@ -58,7 +61,7 @@ def make_manifest(runs: list[str], out_dir, folds=(0, 1, 2, 3, 4), runs_root=Non
                 raise ValueError(f"{src / f'fold{k}.pt'} is {size / 1e6:.0f} MB, the limit is 100 MB")
             models = [{**m, "final": None} if tag and m.get("final") == tag else m for m in models if m["file"] != dst.name]
             models.append(dict(file=dst.name, run=run, fold=k, encoder=cfg["encoder"], work_res=cfg["work_res"],
-                               sha256=sha256_file(dst), commit=meta.get("commit"), final=tag))
+                               sha256=sha256_file(dst), commit=meta.get("commit"), final=tag, **({"rule": rule} if rule else {})))
     manifest = {"models": models}
     (out / MANIFEST).write_text(json.dumps(manifest, indent=1) + "\n", encoding="utf-8", newline="\n")
     return manifest
@@ -121,9 +124,10 @@ def main(argv=None) -> None:
     ap.add_argument("--folds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
     ap.add_argument("--runs-root", help="folder holding <run>/fold<k>.pt (default: FILSEG_RUNS, else ../runs)")
     ap.add_argument("--tag", help="final1 or final2: mark these files in the manifest (notebook setting MODEL)")
+    ap.add_argument("--rule", help="repo-relative keep rule for these entries (default: the notebook uses filseg/rule.json)")
     ap.add_argument("--out", default="weights", help="destination, relative to the repo root")
     a = ap.parse_args(argv)
-    manifest = make_manifest(a.run, D.REPO / a.out, a.folds, a.runs_root, a.tag)
+    manifest = make_manifest(a.run, D.REPO / a.out, a.folds, a.runs_root, a.tag, a.rule)
     for e in manifest["models"]:
         print(f"{e['file']}: run {e['run']} fold {e['fold']} {e['encoder']} work_res {e['work_res']} final {e['final']} sha256 {e['sha256'][:12]}")
     print(f"wrote {D.REPO / a.out / MANIFEST} ({len(manifest['models'])} models)")

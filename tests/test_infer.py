@@ -109,3 +109,17 @@ def test_final_tags_select_one_model(tmp_path):
     infer.make_manifest(["A"], out, [0], runs, tag="final1")             # a tag moves to the new file
     assert {e["file"]: e["final"] for e in json.loads((out / "manifest.json").read_text(encoding="utf-8"))["models"]} == {
         "A_fold0.pt": "final1", "AF_fold5.pt": None}
+
+
+def test_manifest_entry_rule_is_optional_and_must_exist(tmp_path):
+    """`rule` (repo-relative) is stored only when given; the committed final2 entry points at a rule file that exists."""
+    runs, out = tmp_path / "runs", tmp_path / "weights"
+    _fake_run(runs, "t", 0, cfg={"encoder": "resnet18", "work_res": 128})
+    assert "rule" not in infer.make_manifest(["t"], out, [0], runs)["models"][0]
+    with pytest.raises(FileNotFoundError, match="keep rule"): infer.make_manifest(["t"], out, [0], runs, rule="nope.json")
+    e = infer.make_manifest(["t"], out, [0], runs, rule="filseg/rule_fold0.json")["models"][0]
+    assert e["rule"] == "filseg/rule_fold0.json" and infer.load_rule(e["rule"]).peak == 0.995
+    (e, _), = infer.load_models(out)
+    assert e["rule"] == "filseg/rule_fold0.json"
+    final2, = [m for m in json.loads((infer.D.REPO / "weights/manifest.json").read_text(encoding="utf-8"))["models"] if m["final"] == "final2"]
+    assert final2["rule"] == "filseg/rule_fold0.json" and (final2["run"], final2["fold"]) == ("A", 0)

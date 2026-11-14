@@ -6,7 +6,7 @@ Author: Ayush Kasare. Licence: MIT (`LICENSE`).
 
 ## The final model
 
-The default submission (`MODEL = "final1"` in the notebook, file `weights/AF_fold5.pt`) is **one** U-Net (ResNet34, one input channel, 2048 px) trained on all 707 training images (run `AF`; fold index 5 means "every image"), followed by the keep rule in `filseg/rule.json`. A second entry, `final2` (`weights/A_fold0.pt`, submitted as entry S1), is the model of run `A` fold 0, trained on four of the five folds, with the same rule. We use one model and not an average of several because averaging was tested and did not help: averaging models lowered the PQ on fold 0, and the keep rule was tuned on single-model maps, whose probabilities are sharper than those of an average. The final model also sees 25 % more images than any fold model. The cost is that it has no held-out images of its own: its quality is estimated from the five fold models of the same recipe (run `A`), which is what the table reports.
+The default submission (`MODEL = "final1"` in the notebook, file `weights/AF_fold5.pt`) is **one** U-Net (ResNet34, one input channel, 2048 px) trained on all 707 training images (run `AF`; fold index 5 means "every image"), followed by the keep rule in `filseg/rule.json`. A second entry, `final2` (`weights/A_fold0.pt`, submitted as entry S1), is the model of run `A` fold 0, trained on four of the five folds, with its own keep rule `filseg/rule_fold0.json` (peak 0.995, tuned on fold 0 only, the rule entry S1 used). **Final 2 = S1**: `FILSEG_MODEL=final2` rebuilds the submitted S1 file (identical to the one we uploaded, sha256 starting `e454a141b92e`). We use one model and not an average of several because averaging was tested and did not help: averaging models lowered the PQ on fold 0, and the keep rule was tuned on single-model maps, whose probabilities are sharper than those of an average. The final model also sees 25 % more images than any fold model. The cost is that it has no held-out images of its own: its quality is estimated from the five fold models of the same recipe (run `A`), which is what the table reports.
 
 ## Results
 
@@ -24,7 +24,7 @@ Matches, false positives and false negatives of the nested row: 5261, 2589, 2938
 
 | quantity | value |
 |---|---|
-| Kaggle public leaderboard PQ, entry S1 (`final2`) | TBD |
+| Kaggle public leaderboard PQ, entry S1 (`final2`, the fold-0 model alone; its out-of-fold fold-0 PQ is 0.446) | 0.38 (about 0.07 below out-of-fold, a gap other teams report too) |
 | Working resolution (`work_res`, decided by a pilot) | 2048 px |
 | Size of one weight file | 49 MB (fp16) |
 
@@ -56,15 +56,16 @@ Matches, false positives and false negatives of the nested row: 5261, 2589, 2938
 | `filseg/tune.py` | Tunes the keep rule: candidate table, grid search, nested out-of-fold evaluation, bootstrap intervals, failure buckets. Writes `filseg/rule.json`. |
 | `filseg/eda.py` | Data checks: site and year mix, train-test drift, annotator agreement, filament geometry. |
 | `filseg/folds.json` | The frozen assignment of every training image to a fold. |
-| `filseg/rule.json` | The final keep rule. |
+| `filseg/rule.json` | The keep rule of `final1` (tuned on all five folds' out-of-fold maps). |
+| `filseg/rule_fold0.json` | The keep rule of `final2` (entry S1), tuned on fold 0. |
 | `weights/` | The two final fp16 weight files (`AF_fold5.pt`, `A_fold0.pt`) and `manifest.json`. |
 | `tests/` | One test file per module (`python -m pytest tests -q`). |
 
 ## Reproduce the submission
 
-The notebook needs the test images, `weights/` and `filseg/rule.json`; nothing else. With the annotation file also present it scores fold 0 out-of-fold at the end (with the fold-0 model, `final2`). It writes `submission.csv`.
+The notebook needs the test images, `weights/` and the keep rule (`filseg/rule.json`, or the `rule` file named by the manifest entry of the chosen model); nothing else. To reproduce entry S1 run it with `FILSEG_MODEL=final2` (or `MODEL = "final2"`) and all test images: it loads `weights/A_fold0.pt` and `filseg/rule_fold0.json`. With the annotation file also present it scores fold 0 out-of-fold at the end (with the fold-0 model, `final2`). It writes `submission.csv`.
 
-Settings are at the top of the notebook: `MODEL` (`"final1"`, the default, or `"final2"`), `N_IMAGES` (`None` = all test images), `DATA_DIR`, `DEVICE` (GPU if there is one) and `RUN_TRAINING` (`False`). Environment variables can set the same things before launch: `FILSEG_N_IMAGES`, `FILSEG_DATA` (folder that holds `test/test_images` and, optionally, `train/`), `FILSEG_WEIGHTS` (default `weights`), `FILSEG_RULE` (default `filseg/rule.json`), `FILSEG_OUT` (where `submission.csv` is written, default the current folder). Relative paths are taken from the repository root.
+Settings are at the top of the notebook: `MODEL` (`"final1"`, the default, or `"final2"`), `N_IMAGES` (`None` = all test images), `DATA_DIR`, `DEVICE` (GPU if there is one) and `RUN_TRAINING` (`False`). Environment variables can set the same things before launch: `FILSEG_N_IMAGES`, `FILSEG_DATA` (folder that holds `test/test_images` and, optionally, `train/`), `FILSEG_WEIGHTS` (default `weights`), `FILSEG_RULE` (default: the `rule` of the chosen manifest entry, else `filseg/rule.json`), `FILSEG_OUT` (where `submission.csv` is written, default the current folder). Relative paths are taken from the repository root.
 
 **On Kaggle**
 
@@ -94,8 +95,10 @@ jupyter lab notebook.ipynb
 {"models": [{"file": "AF_fold5.pt", "run": "AF", "fold": 5, "encoder": "resnet34",
              "work_res": 2048, "sha256": "...", "commit": "...", "final": "final1"},
             {"file": "A_fold0.pt", "run": "A", "fold": 0, "encoder": "resnet34",
-             "work_res": 2048, "sha256": "...", "commit": "...", "final": "final2"}]}
+             "work_res": 2048, "sha256": "...", "commit": "...", "final": "final2", "rule": "filseg/rule_fold0.json"}]}
 ```
+
+`rule` is optional (repo-relative path); without it the notebook uses `filseg/rule.json`.
 
 `work_res` is the resolution the model was trained and predicts at (the image is area-resized to it and the map is brought back to 2048 px); `commit` is the code version that trained it. The weight files are fp16 `state_dict`s of 49 MB each (under GitHub's 100 MB file limit); `infer.load_models` checks the chosen file against its SHA-256 and never downloads anything (the ImageNet initialisation is only needed for training and is overwritten by the trained weights).
 
@@ -125,7 +128,7 @@ Then, from the repository root:
 ```
 python -m filseg.tune --run A --rule-out filseg/rule.json                   # tune the keep rule on the out-of-fold maps
 python -m filseg.infer --run AF --folds 5 --tag final1 --out weights        # copy the weights, add them to weights/manifest.json
-python -m filseg.infer --run A --folds 0 --tag final2 --out weights
+python -m filseg.infer --run A --folds 0 --tag final2 --rule filseg/rule_fold0.json --out weights
 ```
 
 The notebook's last cell prints the same training commands and can run them on a machine with GPUs (`RUN_TRAINING = True`).
