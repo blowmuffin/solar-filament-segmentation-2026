@@ -1,4 +1,6 @@
 import json
+from dataclasses import asdict
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -8,6 +10,15 @@ from conftest import rect
 from filseg import data as D
 from filseg import instances as inst
 from filseg import tune
+
+
+@pytest.fixture(autouse=True)
+def _one_process(monkeypatch):
+    monkeypatch.setattr(tune, "WORKERS", 1)         # pytest never spawns a pool
+
+
+def test_pmap_with_one_worker_stays_in_process():
+    assert tune._pmap(lambda x: 2 * x, [1, 2, 3], 1) == [2, 4, 6]       # a lambda cannot be sent to a pool
 
 
 def test_fast_pq_equals_exact():           # same toys as test_one_tp_two_fp_one_fn and test_pooled_over_records
@@ -66,7 +77,14 @@ def test_grid_search_drops_the_junk():
     assert v == pytest.approx(1.0) and rule.t_lo == 0.5 and rule.tau is None
     assert (t[tune._keep(t, rule)].area == 400).all()               # the junk (150 px, peak 0.6) is dropped
     assert tune.fast_pq(t[tune._keep(t, rule)], 5) == pytest.approx(v)
-    assert len(tune.GRID["t_lo"]) * len(tune.GRID["peak"]) * len(tune.GRID["mean"]) * len(tune.GRID["min_area"]) * len(tune.GRID["max_r"]) == 3500
+    sizes = [len(v) for v in tune.GRID.values()]
+    assert sizes == [7, 8, 10, 5, 5] and tune.GRID["peak"][-1] == 0.99 and tune.GRID["mean"][-1] == 0.85 and tune.GRID["t_lo"][0] == 0.25
+
+
+def test_on_edge():
+    r = inst.Rule(t_lo=0.25, peak=0.7, mean=0.85, min_area=100, max_r=0.92)
+    assert tune._on_edge(asdict(r)) == {"t_lo": "min", "mean": "max", "min_area": "min"}
+    assert tune._on_edge(asdict(inst.Rule(t_lo=0.4, peak=0.99, mean=0.6, min_area=300, max_r=1.0))) == {"peak": "max", "max_r": "max"}
 
 
 def test_nested_pq_tunes_on_the_other_folds():
@@ -124,9 +142,9 @@ def test_candidate_table_matches_records_and_caches(world, monkeypatch):
     t = tune.candidate_table(["A"], [0, 1], records=recs, root=root)
     a = t[t.stem == S0]
     assert a.t_lo.tolist() == list(tune.T_LO_GRID) and set(a.fold) == {0} and (a.area == 400).all()
-    assert (a.n_rec == 2).all() and (a.n_tp == 2).all() and a.sum_tp_iou.tolist() == pytest.approx([1.6] * 5)
+    assert (a.n_rec == 2).all() and (a.n_tp == 2).all() and a.sum_tp_iou.tolist() == pytest.approx([1.6] * len(tune.T_LO_GRID))
     b = t[t.stem == S1]
-    assert (b.n_rec == 1).all() and b.sum_tp_iou.tolist() == pytest.approx([1.0] * 5)
+    assert (b.n_rec == 1).all() and b.sum_tp_iou.tolist() == pytest.approx([1.0] * len(tune.T_LO_GRID))
     assert (root / "A" / "cands.pkl").exists()
 
     with monkeypatch.context() as m:
@@ -139,7 +157,32 @@ def test_candidate_table_matches_records_and_caches(world, monkeypatch):
     t2 = tune.candidate_table(["A"], [0, 1], records=recs, root=root)
     a2 = t2[t2.stem == S0]
     assert len(a2) == 1 and np.isnan(a2.t_lo.iloc[0]) and a2.n_rec.iloc[0] == 2 and a2.sum_tp_iou.iloc[0] == 0
-    assert len(t2[t2.stem == S1]) == 5
+    assert len(t2[t2.stem == S1]) == len(tune.T_LO_GRID)
+
+
+def test_cache_key_covers_code_folds_and_annotations(world, monkeypatch, tmp_path):
+    root, recs = world
+    calls, real = [], tune._table_chunk
+    monkeypatch.setattr(tune, "_table_chunk", lambda task: calls.append(1) or real(task))
+    src = tmp_path / "feature_code.py"
+    src.write_text("a = 1\n", encoding="utf-8")
+    monkeypatch.setattr(tune, "SOURCES", (src,))
+
+    def builds() -> int:            # rebuilds caused by one call
+        before = len(calls)
+        tune.candidate_table(["A"], [0, 1], records=recs, root=root)
+        return len(calls) - before
+
+    assert builds() == 1 and builds() == 0                          # built once, then a cache hit
+    src.write_text("a = 2\n", encoding="utf-8")                      # feature code (instances, data, tune) edited
+    assert builds() == 1 and builds() == 0
+    folds = Path(D.FOLDS_JSON)
+    folds.write_text(folds.read_text(encoding="utf-8") + "\n", encoding="utf-8")        # folds.json changed
+    assert builds() == 1 and builds() == 0
+    monkeypatch.setattr(D, "TRAIN_JSON_SHA256", "0" * 64)           # another annotation file
+    assert builds() == 1 and builds() == 0
+    monkeypatch.setattr(tune, "T_LO_GRID", (0.3, 0.5))              # another t_lo grid
+    assert builds() == 1 and builds() == 0
 
 
 def test_candidate_table_averages_runs(world):
@@ -148,7 +191,7 @@ def test_candidate_table_averages_runs(world):
     _save(root, "B", 1, [S1], [_prob([])])
     t = tune.candidate_table(["B", "A"], [0, 1], records=recs, root=root)       # mean of 230 and 0 is 0.45
     assert (root / "A+B" / "cands.pkl").exists()
-    assert sorted(t[t.stem == S0].t_lo) == [0.3, 0.35, 0.4, 0.45]
+    assert sorted(t[t.stem == S0].t_lo) == [0.25, 0.3, 0.35, 0.4, 0.45]
 
 
 def test_wrong_fold_file_is_refused(world):
@@ -158,7 +201,8 @@ def test_wrong_fold_file_is_refused(world):
         tune.candidate_table(["A"], [0], records=recs, root=root)
 
 
-def test_cli_end_to_end(tmp_path, monkeypatch, capsys):
+def _toy_world(tmp_path, monkeypatch):
+    """10 stems in 5 folds (2 each) with maps under tmp_path/runs/toy; D.FOLDS_JSON and D.load_records point at them."""
     stems = [f"201101{i + 1:02d}104734{'Ch' if i % 2 else 'Lh'}" for i in range(10)]
     folds = tmp_path / "folds.json"
     folds.write_text(json.dumps({s: i % 5 for i, s in enumerate(stems)}), encoding="utf-8")
@@ -180,16 +224,49 @@ def test_cli_end_to_end(tmp_path, monkeypatch, capsys):
             probs.append(p if i != 9 else _prob([]))                                  # the last stem finds nothing
         _save(root, "toy", k, fold_stems, probs)
     monkeypatch.setattr(D, "load_records", lambda: recs)
+    return recs, root
+
+
+def test_cli_end_to_end(tmp_path, monkeypatch, capsys):
+    recs, root = _toy_world(tmp_path, monkeypatch)
+    repo_rule = Path(tune.__file__).with_name("rule.json")
+    before = repo_rule.read_bytes() if repo_rule.exists() else None
     out = tmp_path / "rule.json"
-    tune.main(["--run", "toy", "--runs-root", str(root), "--rule-out", str(out)])
+    tune.main(["--run", "toy", "--runs-root", str(root), "--rule-out", str(out), "--workers", "1"])
     text = capsys.readouterr().out
     for word in ("baseline", "best rule", "nested PQ", "SQ", "RQ", "matched", "discarded", "wrong_shape", "never_detected",
                  "annotators", "site", "within 24 h"):
         assert word in text, word
+    assert "inner-CV" not in text
+    assert (repo_rule.read_bytes() if repo_rule.exists() else None) == before       # nothing written into the repo
+    assert (root / "toy" / "rule.json").read_text(encoding="utf-8") == out.read_text(encoding="utf-8")
     summ = json.loads((root / "toy" / "tune_summary.json").read_text(encoding="utf-8"))
+    assert summ["best_rule"]["t_lo"] == 0.25 and summ["grid_edges"]["best"]["t_lo"] == "min"     # identical rows at every t_lo: first wins
+    assert "WARN: the best rule sits on a grid edge" in text and "t_lo 0.25 (grid min)" in text
     n_gt = sum(len(v) for r in recs.values() for v in r.values())
     assert sum(summ["failure_buckets"].values()) == n_gt
     assert 0.0 < summ["nested"]["pq"] <= 1.0 and summ["nested"]["ci"][0] <= summ["nested"]["pq"] <= summ["nested"]["ci"][1]
     assert abs(summ["exact_check"]["fast_pq"] - summ["exact_check"]["pq_score"]) <= 0.002
     rule = inst.Rule(**json.loads(out.read_text(encoding="utf-8")))
     assert rule.peak >= 0.5 and rule.tau is None
+
+
+def test_cli_pilot_is_labelled_and_writes_its_own_files(tmp_path, monkeypatch, capsys):
+    recs, root = _toy_world(tmp_path, monkeypatch)
+    repo_rule = Path(tune.__file__).with_name("rule.json")
+    before = repo_rule.read_bytes() if repo_rule.exists() else None
+    tune.main(["--run", "toy", "--folds", "0", "--runs-root", str(root), "--workers", "1"])
+    text = capsys.readouterr().out
+    label = "inner-CV (fold 0 only, not nested OOF)"
+    assert text.count(label) >= 3 and "nested PQ" not in text          # headline, ablation table and slices carry it
+    assert "NOTE: one fold only" in text
+    run = root / "toy"
+    assert (run / "tune_summary_folds0.json").exists() and (run / "rule_folds0.json").exists()
+    assert not (run / "tune_summary.json").exists() and not (run / "rule.json").exists()
+    assert (repo_rule.read_bytes() if repo_rule.exists() else None) == before
+    summ = json.loads((run / "tune_summary_folds0.json").read_text(encoding="utf-8"))
+    assert summ["label"] == label and summ["nested"]["pilot_inner_cv"] and summ["n_images"] == 2
+    inst.Rule(**json.loads((run / "rule_folds0.json").read_text(encoding="utf-8")))
+    # a full run next to it keeps its own names
+    tune.main(["--run", "toy", "--runs-root", str(root), "--workers", "1"])
+    assert (run / "tune_summary.json").exists() and (run / "tune_summary_folds0.json").exists()

@@ -1,6 +1,7 @@
 """Tuning and evaluation tools: candidate table, fast PQ, keep-rule grid search, nested OOF PQ, bootstrap
 intervals, failure buckets. CLI: python -m filseg.tune --run A [B] [--folds 0]."""
 import argparse
+import hashlib
 import json
 import math
 import multiprocessing as mp
@@ -16,18 +17,21 @@ import pandas as pd
 from pycocotools import mask as mask_util
 
 from filseg import data as D
+from filseg import instances as _instances
 from filseg import pq
 from filseg.instances import RUNS, Rule, _Slabs, candidates, select, to_rles
 
-T_LO_GRID = (0.30, 0.35, 0.40, 0.45, 0.50)
-GRID = dict(t_lo=T_LO_GRID, peak=(0.5, 0.6, 0.7, 0.8, 0.9), mean=(0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70),
-            min_area=(100, 200, 300, 400), max_r=(0.88, 0.90, 0.92, 0.95, 1.00))
+T_LO_GRID = (0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55)
+GRID = dict(t_lo=T_LO_GRID, peak=(0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.98, 0.99),
+            mean=(0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85),
+            min_area=(100, 200, 300, 400, 600), max_r=(0.88, 0.90, 0.92, 0.95, 1.00))
 OFF = dict(t_lo=(0.5,), peak=(0.0,), mean=(0.0,), min_area=(0,), max_r=(1e9,))     # "no filter", t_lo 0.5
 RULE_COLS = ("t_lo", "peak", "mean", "min_area", "max_r")
 BUCKETS = ("matched", "discarded", "wrong_shape", "never_detected")
 FEATS = ("area", "peak", "mean", "p10", "p50", "cy", "cx", "r_frac", "w", "h", "fill", "major", "minor")
 DTYPES = {"id": "int32", "area": "int32", "w": "int16", "h": "int16", "n_rec": "int8", "n_tp": "int16", "fold": "int8"}
 WORKERS = min(os.cpu_count() or 1, 12)
+SOURCES = (Path(__file__), Path(_instances.__file__), Path(D.__file__))    # the code the candidate rows come from
 
 
 def _runs_root() -> Path:
@@ -126,12 +130,21 @@ def _maps(items):
             rd.close()
 
 
-def _pmap(fn, tasks: list) -> list:
-    w = min(WORKERS, len(tasks))
+def _pmap(fn, tasks: list, workers: int) -> list:
+    """fn over tasks, in order; workers <= 1 runs in this process (no pool is spawned)."""
+    w = min(workers, len(tasks))
     if w <= 1:
         return [fn(t) for t in tasks]
-    with mp.Pool(w) as pool:
-        return pool.map(fn, tasks, chunksize=1)
+    pool = mp.Pool(w)
+    try:
+        out = pool.map(fn, tasks, chunksize=1)
+        pool.close()
+        return out
+    except BaseException:
+        pool.terminate()
+        raise
+    finally:
+        pool.join()
 
 
 def _chunks(plan: dict, records: dict, *extra) -> list[tuple]:
@@ -158,26 +171,40 @@ def _table_chunk(task) -> list[dict]:
     return rows
 
 
-def _sig(runs, k, root) -> list:
-    """What the cached rows of fold k were built from: each run's map file (size, mtime) and the t_lo grid."""
+def _code_key() -> str:
+    """Hash of everything but the maps that the rows depend on: the source of instances.py (features), data.py
+    (records), this file (matching, dtypes), folds.json, the annotation file's SHA-256 and the t_lo grid."""
+    h = hashlib.sha256()
+    for p in (*SOURCES, Path(D.FOLDS_JSON)):
+        h.update(Path(p).read_bytes())
+    h.update((D.TRAIN_JSON_SHA256 + repr(T_LO_GRID)).encode())
+    return h.hexdigest()
+
+
+def _sig(runs, k, root, code) -> list:
+    """What the cached rows of fold k were built from: each run's map file (size, mtime) and the code key."""
     stats = [(Path(root) / r / f"oof_fold{k}.npz").stat() for r in sorted(runs)]
-    return [(r, s.st_size, s.st_mtime_ns) for r, s in zip(sorted(runs), stats)] + [T_LO_GRID]
+    return [(r, s.st_size, s.st_mtime_ns) for r, s in zip(sorted(runs), stats)] + [code]
 
 
-def candidate_table(runs: list[str], folds: list[int], records: dict | None = None, root=None) -> pd.DataFrame:
+def candidate_table(runs: list[str], folds: list[int], records: dict | None = None, root=None,
+                    workers: int | None = None) -> pd.DataFrame:
     """One row per component per t_lo: stem, fold, t_lo, id, features, n_rec, n_tp, sum_tp_iou (the sum over
     the stem's records of the matched IoU when > 0.5, else 0). A stem with no component has one row with
-    t_lo NaN. Cached in <root>/<runs joined by +>/cands.pkl, one signature per fold (map files, t_lo grid)."""
+    t_lo NaN. Cached in <root>/<runs joined by +>/cands.pkl, one signature per fold (map files and _code_key):
+    a change to the feature code, folds.json, the annotation SHA or a map file rebuilds the fold."""
     root = Path(root) if root else _runs_root()
     cache = root / "+".join(sorted(runs)) / "cands.pkl"
     # the cache is a file this function wrote itself under ../runs, never downloaded data, so pickle is safe here
     old = pickle.loads(cache.read_bytes()) if cache.exists() else dict(sig={}, table=None)
-    sig = {k: _sig(runs, k, root) for k in folds}
+    code = _code_key()
+    sig = {k: _sig(runs, k, root, code) for k in folds}
     need = [k for k in folds if old["sig"].get(k) != sig[k]]
     if need:
         records = D.load_records() if records is None else records
         fold_of = json.loads(Path(D.FOLDS_JSON).read_text(encoding="utf-8"))
-        rows = [r for part in _pmap(_table_chunk, _chunks(_plan(runs, need, root), records)) for r in part]
+        parts = _pmap(_table_chunk, _chunks(_plan(runs, need, root), records), WORKERS if workers is None else workers)
+        rows = [r for part in parts for r in part]
         new = pd.DataFrame(rows).assign(fold=lambda d: d.stem.map(fold_of)).astype(DTYPES)
         keep = old["table"][~old["table"].fold.isin(need)] if old["table"] is not None else None
         old = dict(sig={**{k: v for k, v in old["sig"].items() if k not in need}, **{k: sig[k] for k in need}},
@@ -225,6 +252,11 @@ def grid_search(table: pd.DataFrame, n_gt: int, grid: dict = GRID) -> tuple[Rule
                         if v > best_pq:
                             best_pq, best = v, Rule(t, p, m, a, r)
     return best, float(best_pq)
+
+
+def _on_edge(values: dict) -> dict[str, str]:
+    """The rule parameters that sit on the smallest or largest value of their grid: {name: "min" | "max"}."""
+    return {c: "min" if values[c] == min(GRID[c]) else "max" for c in RULE_COLS if values[c] in (min(GRID[c]), max(GRID[c]))}
 
 
 def _pq(df: pd.DataFrame) -> float:
@@ -358,19 +390,31 @@ def main(argv: list[str] | None = None) -> dict:
     ap.add_argument("--run", nargs="+", required=True)
     ap.add_argument("--folds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
     ap.add_argument("--runs-root", default=None)
-    ap.add_argument("--rule-out", default=str(Path(__file__).with_name("rule.json")))
+    ap.add_argument("--rule-out", default=None, help="also write the tuned rule here (e.g. filseg/rule.json); "
+                    "nothing is written into the repo otherwise")
+    ap.add_argument("--workers", type=int, default=WORKERS, help="processes for the passes over the maps; 1 = no pool")
     a = ap.parse_args(argv)
     root = Path(a.runs_root) if a.runs_root else _runs_root()
     runs, S = a.run, {"runs": a.run, "folds": a.folds}
+    full = sorted(a.folds) == [0, 1, 2, 3, 4]
+    suffix = "" if full else "_folds" + "_".join(str(k) for k in sorted(a.folds))     # a partial run never overwrites a full one
+    out_dir = root / "+".join(sorted(runs))
 
     t0 = time.perf_counter()
     records = D.load_records()
-    table = candidate_table(runs, a.folds, records=records, root=root)
+    table = candidate_table(runs, a.folds, records=records, root=root, workers=a.workers)
     S["seconds_table"] = round(time.perf_counter() - t0, 1)
     stems = sorted(table.stem.unique())
     n_gt = _n_gt(records, stems)
     S["n_images"], S["n_filaments"], S["n_rows"] = len(stems), int(n_gt.sum()), len(table)
     pilot = table.fold.nunique() < 2
+    if full:
+        label, head = "nested OOF", "nested PQ"
+    else:
+        label = (f"inner-CV (fold {sorted(a.folds)[0]} only, not nested OOF)" if pilot
+                 else f"nested over folds {sorted(a.folds)} only, not the 5-fold nested OOF")
+        head = f"PQ [{label}]"
+    S["label"] = label
     print(f"runs {'+'.join(runs)}, folds {a.folds}: {len(stems)} images, {int(n_gt.sum())} filaments, {len(table)} candidate rows "
           f"({S['seconds_table']} s for the table)")
     if pilot:
@@ -386,13 +430,13 @@ def main(argv: list[str] | None = None) -> dict:
     order = ("peak", "mean", "min_area", "max_r", "t_lo")
     names = ("baseline (t_lo 0.5, no filter)", "+ peak", "+ mean", "+ min_area", "+ max_r", "+ t_lo (full grid)")
     S["steps"] = []
-    print("\nnested PQ, one row per filter added (rule shown is tuned on all rows)")
+    print(f"\n{head}, one row per filter added (rule shown is tuned on all rows)")
     for i, name in enumerate(names):
         g = {**OFF, **{c: GRID[c] for c in order[:i]}}
         v, per = nested_pq(table, records, g)
         r, ins = grid_search(table, int(n_gt.sum()), g) if i < len(order) else (best, in_sample)
         S["steps"].append(dict(step=name, nested_pq=v, in_sample_pq=ins, rule=asdict(r)))
-        print(f"  {name:32s} nested {v:.4f}  in-sample {ins:.4f}  rule t_lo {r.t_lo} peak {r.peak} mean {r.mean} "
+        print(f"  {name:32s} held-out {v:.4f}  in-sample {ins:.4f}  rule t_lo {r.t_lo} peak {r.peak} mean {r.mean} "
               f"min_area {r.min_area} max_r {r.max_r if r.max_r < 1e9 else 'none'}")
         if i == 0:
             base_per, base_pq = per, v
@@ -401,6 +445,16 @@ def main(argv: list[str] | None = None) -> dict:
     print(f"\nbaseline (t_lo 0.5, no filter): PQ {base_pq:.4f}  95% interval {bci[0]:.4f} to {bci[1]:.4f}")
     S["baseline"] = dict(pq=base_pq, ci=bci)
     print(f"best rule (all rows): {asdict(best)}  in-sample PQ {in_sample:.4f}  ({S['seconds_grid_search']} s for the grid search)")
+    edge = _on_edge(asdict(best))
+    groups = per_nested.drop_duplicates("cv")
+    edge_n = {c: int(groups[c].isin([min(GRID[c]), max(GRID[c])]).sum()) for c in RULE_COLS}
+    S["grid_edges"] = dict(best=edge, groups=len(groups), per_group_count={c: n for c, n in edge_n.items() if n})
+    if edge:
+        print("WARN: the best rule sits on a grid edge, the grid may be binding: " +
+              ", ".join(f"{c} {asdict(best)[c]} (grid {e})" for c, e in edge.items()))
+    if S["grid_edges"]["per_group_count"]:
+        print(f"WARN: groups whose tuned rule sits on a grid edge (of {len(groups)}): " +
+              ", ".join(f"{c} {n}" for c, n in S["grid_edges"]["per_group_count"].items()))
 
     lo, hi = bootstrap_ci(per_nested)
     tp, k, ng = int(per_nested.tp.sum()), int(per_nested.k.sum()), int(per_nested.n_gt.sum())
@@ -408,14 +462,14 @@ def main(argv: list[str] | None = None) -> dict:
     gain, share = paired_bootstrap(base_per, per_nested)
     S["nested"] = dict(pq=nested, ci=(lo, hi), sq=sq, rq=rq, tp=tp, fp=k - tp, fn=ng - tp, pilot_inner_cv=pilot)
     S["gain_over_baseline"] = dict(gain=gain, share_above_zero=share)
-    print(f"nested PQ {nested:.4f}  95% interval {lo:.4f} to {hi:.4f}  SQ {sq:.4f}  RQ {rq:.4f}  TP {tp}  FP {k - tp}  FN {ng - tp}")
+    print(f"{head} {nested:.4f}  95% interval {lo:.4f} to {hi:.4f}  SQ {sq:.4f}  RQ {rq:.4f}  TP {tp}  FP {k - tp}  FN {ng - tp}")
     print(f"gain over baseline {gain:+.4f}, paired bootstrap share of resamples above zero {share:.3f} "
           f"(adoption rule: gain >= 0.005 and share >= 0.90)")
 
     # second pass over the maps: the nested rule of each stem, and the final rule scored exactly
     t0 = time.perf_counter()
     rules = per_nested.set_index("stem")[list(RULE_COLS)].to_dict("index")
-    parts = _pmap(_eval_chunk, _chunks(_plan(runs, a.folds, root), records, rules, best))
+    parts = _pmap(_eval_chunk, _chunks(_plan(runs, a.folds, root), records, rules, best), a.workers)
     gt = pd.DataFrame([r for p in parts for r in p[0]], columns=["stem", "area", "r_frac", "bucket", "tp_iou"])
     fp = pd.DataFrame([r for p in parts for r in p[1]], columns=["stem", "area", "r_frac"])
     preds = {s: v for p in parts for s, v in p[2].items()}
@@ -442,7 +496,7 @@ def main(argv: list[str] | None = None) -> dict:
     S["slices"]["site"] = _slices_image(per_nested, {s: s[-2:] for s in stems})
     S["slices"]["within_24h"] = _slices_image(per_nested, {s: "with a training image within 24 h" if near[s]
                                                            else "without a training image within 24 h" for s in stems})
-    print("\nslices (nested PQ)")
+    print(f"\nslices ({head})")
     titles = dict(size_px="filament size, px (thirds of the ground truth)", r_frac="distance from disk centre, r / R (thirds)",
                   annotators="annotators", site="site", within_24h="training image within 24 h")
     for key, rows in S["slices"].items():
@@ -451,10 +505,13 @@ def main(argv: list[str] | None = None) -> dict:
             extra = f"  95% {r['lo']:.4f} to {r['hi']:.4f}  images {r['n_images']}" if "lo" in r else f"  TP {r['tp']} FP {r['fp']} FN {r['fn']}"
             print(f"    {r['slice']:40s} PQ {r['pq']:.4f}  filaments {r['n_gt']}{extra}")
 
-    Path(a.rule_out).write_text(json.dumps(asdict(best), indent=1) + "\n", encoding="utf-8", newline="\n")
-    out = root / "+".join(sorted(runs)) / "tune_summary.json"
+    rule_text = json.dumps(asdict(best), indent=1) + "\n"
+    paths = [out_dir / f"rule{suffix}.json"] + ([Path(a.rule_out)] if a.rule_out else [])
+    for path in paths:
+        path.write_text(rule_text, encoding="utf-8", newline="\n")
+    out = out_dir / f"tune_summary{suffix}.json"
     out.write_text(json.dumps(S, indent=1, default=_jsonable) + "\n", encoding="utf-8", newline="\n")
-    print(f"\nwrote {a.rule_out} and {out}")
+    print("\nwrote " + ", ".join(str(p) for p in [*paths, out]))
     return S
 
 
