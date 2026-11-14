@@ -31,7 +31,7 @@ def _check(job: str, jobs: list[str]) -> None:
     runs = json.loads((REPO / "configs" / "runs.json").read_text(encoding="utf-8"))
     for j in jobs:
         run, _, fold = j.rpartition(":")
-        if run not in runs or not fold.isdigit() or int(fold) > 4: raise ValueError(f"bad job {j!r}: RUN:FOLD, RUN in runs.json, FOLD 0..4")
+        if run not in runs or not fold.isdigit() or int(fold) > 5: raise ValueError(f"bad job {j!r}: RUN:FOLD, RUN in runs.json, FOLD 0..5 (5 = all stems)")
 
 
 def _writefile(path: str, text: str) -> str:

@@ -125,7 +125,7 @@ def main(argv=None) -> int:
     if len(set(specs)) != len(specs): raise ValueError(f"duplicate jobs in {specs}")
     cfgs = [load_cfg(*parse(s)) for s in specs]          # a bad run name or fold fails here, before any GPU time
     n_folds = 1 + max(json.loads(D.FOLDS_JSON.read_text(encoding="utf-8")).values())
-    if any(c.fold >= n_folds for c in cfgs): raise ValueError(f"fold out of range 0..{n_folds - 1}: {specs}")
+    if any(c.fold > n_folds for c in cfgs): raise ValueError(f"fold out of range 0..{n_folds} (5 = all stems): {specs}")
     nvidia_smi()
     build_caches(sorted({c.work_res for c in cfgs}))
     with ThreadPoolExecutor(len(cfgs)) as ex:

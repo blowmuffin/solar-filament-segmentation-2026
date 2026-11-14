@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from filseg import data as D
 from filseg.config import load_cfg
 from filseg.model import gpu_stats, load_model, run_dir
+from filseg.train import FULL_FOLD
 
 FLIPS = [(), (3,), (2,), (2, 3)]        # views on (N, C, H, W): as is, left-right, up-down, both
 
@@ -45,11 +46,12 @@ def quantize(p: np.ndarray) -> np.ndarray:
 
 
 def predict_fold(cfg, device: str) -> None:
-    """Reload <run>/fold<k>.pt; write oof_fold<k>.npz (the fold's validation stems) and test_fold<k>.npz (all test stems)."""
+    """Reload <run>/fold<k>.pt; write oof_fold<k>.npz (the fold's validation stems; none for fold 5) and test_fold<k>.npz (all test stems)."""
     out = run_dir(cfg.run)
     folds = json.loads(D.FOLDS_JSON.read_text(encoding="utf-8"))
     sets = {"oof": (sorted(s for s, k in folds.items() if k == cfg.fold), D.TRAIN_IMG),
             "test": (sorted(p.stem for p in D.TEST_IMG.glob("*.jpeg")), D.TEST_IMG)}
+    if cfg.fold == FULL_FOLD: del sets["oof"]               # the full-data model has no held-out stems
     m = load_model(out / f"fold{cfg.fold}.pt", device)
     print(f"predict {cfg.run} fold {cfg.fold}: work_res {cfg.work_res}, device {device}, "
           f"{ {k: len(v[0]) for k, v in sets.items()} } images, outputs in {out}", flush=True)

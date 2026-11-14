@@ -19,6 +19,9 @@ from filseg.model import build_model, gpu_stats, run_dir, save_fp16
 N_VAL = 200         # fixed validation crops, for the log only
 
 
+FULL_FOLD = 5       # fold index 5 = train on every stem, no validation (folds.json holds folds 0-4)
+
+
 def job_seed(cfg) -> int:
     return 1000 * cfg.seed + cfg.fold      # PROTOCOL 4: 1000 x run index + fold
 
@@ -135,13 +138,14 @@ def train(cfg, device="cuda", pretrained=True, workers=2) -> None:
     assert set(stems) == set(folds), "cache stems differ from folds.json"
     tr = [i for i, s in enumerate(stems) if folds[s] != cfg.fold]
     va = [i for i, s in enumerate(stems) if folds[s] == cfg.fold]
-    assert tr and va, f"fold {cfg.fold}: {len(tr)} train / {len(va)} validation images"
+    assert tr and (va or cfg.fold == FULL_FOLD), f"fold {cfg.fold}: {len(tr)} train / {len(va)} validation images"
     print(f"cache {D.CACHE_ROOT}: img {img.shape} {img.nbytes / 1e9:.2f} GB, soft {soft.shape} {soft.nbytes / 1e9:.2f} GB; "
           f"{len(tr)} train / {len(va)} validation images", flush=True)
     t0 = time.time()
-    train_ds, val_ds = Crops(img, soft, tr, cfg, seed), Crops(img, soft, va, cfg, seed)
-    val_rng = np.random.default_rng(12345)                      # the same N_VAL crops every epoch
-    vx, vt = (torch.stack(a) for a in zip(*(val_ds.sample(val_rng, aug=False) for _ in range(N_VAL))))
+    train_ds = Crops(img, soft, tr, cfg, seed)
+    if va:
+        val_ds, val_rng = Crops(img, soft, va, cfg, seed), np.random.default_rng(12345)     # the same N_VAL crops every epoch
+        vx, vt = (torch.stack(a) for a in zip(*(val_ds.sample(val_rng, aug=False) for _ in range(N_VAL))))
     print(f"sampler stats and {N_VAL} validation crops ready in {time.time() - t0:.0f} s", flush=True)
 
     model = build_model(cfg.encoder, pretrained).to(device).to(memory_format=torch.channels_last)
@@ -176,7 +180,7 @@ def train(cfg, device="cuda", pretrained=True, workers=2) -> None:
             if not math.isfinite(train_loss): raise RuntimeError(f"epoch {epoch}: train loss is {train_loss}")
             epoch_train_s = time.time() - t0; train_s += epoch_train_s
             if t_warm is not None: steady = (time.time() - t_warm - val_s) / (step - warm)
-            tv = time.time(); val_loss = validate(ema, vx, vt, cfg.batch, cfg.dice_w, amp, device); val_s += time.time() - tv
+            tv = time.time(); val_loss = validate(ema, vx, vt, cfg.batch, cfg.dice_w, amp, device) if va else float('nan'); val_s += time.time() - tv
             log.writerow([epoch, f"{train_loss:.5f}", f"{val_loss:.5f}", f"{time.time() - t0:.1f}"]); fh.flush()
             print(f"epoch {epoch}/{cfg.epochs} train_loss {train_loss:.4f} val_loss(ema) {val_loss:.4f} "
                   f"lr {opt.param_groups[0]['lr']:.2e} {epoch_train_s / cfg.steps:.3f} s/step "

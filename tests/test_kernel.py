@@ -18,6 +18,12 @@ def test_kernel_bundle(tmp_path):
     assert "python -m filseg.job A:0 A2:0" in nb and "folds.json" in nb
 
 
+def test_kernel_accepts_full_data_fold(tmp_path):
+    mk.build("t", ["AF:5", "AF2:5"], out=tmp_path, allow_dirty=True)
+    assert "python -m filseg.job AF:5 AF2:5" in (tmp_path / "t" / "job.ipynb").read_text(encoding="utf-8")
+    assert job.parse("AF:5") == ("AF", 5)
+
+
 def test_kernel_cells(tmp_path):
     """Cell order and the Kaggle-notebook pitfalls: no mkdir in %%writefile, empty cell bodies are rejected."""
     mk.build("t", ["A:0"], out=tmp_path, allow_dirty=True)
@@ -45,7 +51,7 @@ def test_kernel_embeds_commit_and_refuses_dirty(tmp_path, monkeypatch):
     assert "+dirty" not in (tmp_path / "t" / "job.ipynb").read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("name,jobs", [("Bad Name", ["A:0"]), ("t", ["Z:0"]), ("t", ["A:5"]), ("t", ["A"]), ("t", [])])
+@pytest.mark.parametrize("name,jobs", [("Bad Name", ["A:0"]), ("t", ["Z:0"]), ("t", ["A:6"]), ("t", ["A"]), ("t", [])])
 def test_kernel_rejects_bad_names_and_jobs(tmp_path, name, jobs):
     with pytest.raises((ValueError, KeyError)): mk.build(name, jobs, out=tmp_path, allow_dirty=True)
 

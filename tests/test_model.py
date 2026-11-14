@@ -169,6 +169,40 @@ def test_train_loop_dry_cpu(tmp_path, monkeypatch):
     with pytest.raises(SystemExit): train.train(cfg, device="cpu", pretrained=False, workers=0)   # never overwrite
 
 
+def test_train_full_data_fold5_cpu(tmp_path, monkeypatch, capsys):
+    """Fold 5 = every stem trains, no validation set (val_loss is NaN), fold5.pt written; fold 6 still fails loudly."""
+    stems = [f"s{i}" for i in range(6)]
+    (tmp_path / "cache").mkdir(); runs = tmp_path / "runs"
+    for name, a in zip(("img", "soft"), fake_cache(6)): a.tofile(tmp_path / "cache" / f"{name}_256.u8")
+    (tmp_path / "cache" / "stems.json").write_text(json.dumps(stems), encoding="utf-8")
+    folds = tmp_path / "folds.json"; folds.write_text(json.dumps({s: i // 2 for i, s in enumerate(stems)}), encoding="utf-8")
+    monkeypatch.setattr(D, "CACHE_ROOT", tmp_path / "cache"); monkeypatch.setattr(D, "FOLDS_JSON", folds)
+    monkeypatch.setenv("FILSEG_RUNS", str(runs)); monkeypatch.setattr(torch.optim, "AdamW", NoStepAdamW)
+    kw = dict(run="t", work_res=256, crop=64, batch=2, steps=2, epochs=1, ema=0.9)
+    train.train(Cfg(fold=5, **kw), device="cpu", pretrained=False, workers=0)
+    assert "6 train / 0 validation images" in capsys.readouterr().out
+    out = runs / "t"
+    rows = (out / "fold5_log.csv").read_text(encoding="utf-8").splitlines()
+    assert rows[0] == "epoch,train_loss,val_loss,seconds" and len(rows) == 2 and rows[1].split(",")[2] == "nan"
+    assert (out / "fold5_train.json").exists() and (out / "fold5.pt").stat().st_size > 0
+    with pytest.raises(AssertionError): train.train(Cfg(fold=6, **kw), device="cpu", pretrained=False, workers=0)
+
+
+def test_predict_full_data_fold5_cpu(tmp_path, monkeypatch):
+    """Fold 5 writes test_fold5.npz and the predict json only: no held-out stems, so no oof file."""
+    (tmp_path / "test").mkdir()
+    for s in ("t1", "t0"):
+        cv2.imwrite(str(tmp_path / "test" / f"{s}.jpeg"), np.random.default_rng(0).integers(0, 255, (2048, 2048), dtype=np.uint8))
+    folds = tmp_path / "folds.json"; folds.write_text(json.dumps({"a": 0, "b": 1}), encoding="utf-8")
+    monkeypatch.setattr(D, "TEST_IMG", tmp_path / "test"); monkeypatch.setattr(D, "FOLDS_JSON", folds)
+    monkeypatch.setenv("FILSEG_RUNS", str(tmp_path / "runs"))
+    model.save_fp16(model.build_model(pretrained=False), tmp_path / "runs" / "t" / "fold5.pt")
+    predict.predict_fold(Cfg(run="t", fold=5, work_res=256), device="cpu")
+    got = sorted(p.name for p in (tmp_path / "runs" / "t").iterdir())
+    assert got == ["fold5.pt", "fold5_predict.json", "test_fold5.npz"]
+    assert np.load(tmp_path / "runs" / "t" / "test_fold5.npz")["stems"].tolist() == ["t0", "t1"]
+
+
 def test_predict_fold_cpu(tmp_path, monkeypatch):
     """predict_fold on fake 2048 px images: file names, keys, dtypes, shapes, stems, fold selection."""
     for d in ("train", "test"):
