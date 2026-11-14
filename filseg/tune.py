@@ -22,8 +22,8 @@ from filseg import pq
 from filseg.instances import RUNS, Rule, _Slabs, candidates, select, to_rles
 
 T_LO_GRID = (0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55)
-GRID = dict(t_lo=T_LO_GRID, peak=(0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.98, 0.99),
-            mean=(0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85),
+GRID = dict(t_lo=T_LO_GRID, peak=(0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.98, 0.99, 0.995, 1.0),   # 1.0 = saturated (255/255)
+            mean=(0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95),
             min_area=(100, 200, 300, 400, 600), max_r=(0.88, 0.90, 0.92, 0.95, 1.00))
 OFF = dict(t_lo=(0.5,), peak=(0.0,), mean=(0.0,), min_area=(0,), max_r=(1e9,))     # "no filter", t_lo 0.5
 RULE_COLS = ("t_lo", "peak", "mean", "min_area", "max_r")

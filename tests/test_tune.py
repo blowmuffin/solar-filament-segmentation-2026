@@ -78,13 +78,13 @@ def test_grid_search_drops_the_junk():
     assert (t[tune._keep(t, rule)].area == 400).all()               # the junk (150 px, peak 0.6) is dropped
     assert tune.fast_pq(t[tune._keep(t, rule)], 5) == pytest.approx(v)
     sizes = [len(v) for v in tune.GRID.values()]
-    assert sizes == [7, 8, 10, 5, 5] and tune.GRID["peak"][-1] == 0.99 and tune.GRID["mean"][-1] == 0.85 and tune.GRID["t_lo"][0] == 0.25
+    assert sizes == [7, 10, 12, 5, 5] and tune.GRID["peak"][-1] == 1.0 and tune.GRID["mean"][-1] == 0.95 and tune.GRID["t_lo"][0] == 0.25
 
 
 def test_on_edge():
-    r = inst.Rule(t_lo=0.25, peak=0.7, mean=0.85, min_area=100, max_r=0.92)
+    r = inst.Rule(t_lo=0.25, peak=0.7, mean=0.95, min_area=100, max_r=0.92)
     assert tune._on_edge(asdict(r)) == {"t_lo": "min", "mean": "max", "min_area": "min"}
-    assert tune._on_edge(asdict(inst.Rule(t_lo=0.4, peak=0.99, mean=0.6, min_area=300, max_r=1.0))) == {"peak": "max", "max_r": "max"}
+    assert tune._on_edge(asdict(inst.Rule(t_lo=0.4, peak=1.0, mean=0.6, min_area=300, max_r=1.0))) == {"peak": "max", "max_r": "max"}
 
 
 def test_nested_pq_tunes_on_the_other_folds():
