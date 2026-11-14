@@ -69,14 +69,14 @@ Settings are at the top of the notebook: `MODEL` (`"final1"`, the default, or `"
 **On Kaggle**
 
 1. Create a notebook, switch the accelerator to a T4 GPU (a CPU works, much slower) and attach the competition data as an input; the notebook finds it under `/kaggle/input`.
-2. Get the repository: `!git clone <URL of this repository>` and `%cd` into it, or attach it as a dataset.
+2. Get the repository: `!git clone https://github.com/blowmuffin/solar-filament-segmentation-2026` and `%cd` into it, or attach it as a dataset.
 3. `!pip install -q segmentation-models-pytorch==0.6.0 pycocotools==2.0.11` (the Kaggle image already has the other packages).
 4. Run `notebook.ipynb`, or headless: `!FILSEG_OUT=/kaggle/working jupyter nbconvert --to notebook --execute notebook.ipynb --output-dir /kaggle/working`. The result is `submission.csv`.
 
 **Locally**
 
 ```
-git clone <URL of this repository>
+git clone https://github.com/blowmuffin/solar-filament-segmentation-2026
 cd <repository>
 python -m venv .venv && source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt jupyterlab                # any recent Jupyter will do, it is not pinned
@@ -114,10 +114,10 @@ python tools/make_kernel.py --job retrain-c --jobs A:4 AF:5
 python -m kaggle kernels push -p ../kaggle/retrain-c --accelerator NvidiaTeslaT4 -t 14400
 ```
 
-`A` and `AF` are run names from `configs/runs.json` (the same recipe at 2048 px; `AF` is trained on all images, fold index 5). Each job builds the training cache, trains, and predicts the validation images (for `AF:5`, nothing is held out) and the test images. When a kernel has finished (`python -m kaggle kernels status <owner>/filseg-retrain-a`), download its files into `../runs` so that `../runs/A/fold<k>.pt` and `../runs/AF/fold5.pt` exist:
+`A` and `AF` are run names from `configs/runs.json` (the same recipe at 2048 px; `AF` is trained on all images, fold index 5). Each job builds the training cache, trains, and predicts the validation images (for `AF:5`, nothing is held out) and the test images. When a kernel has finished (`python -m kaggle kernels status <your-kaggle-user>/filseg-retrain-a`), download its files into `../runs` so that `../runs/A/fold<k>.pt` and `../runs/AF/fold5.pt` exist:
 
 ```
-python -m kaggle kernels output <owner>/filseg-retrain-a -p ../runs --file-pattern <pattern>
+python -m kaggle kernels output <your-kaggle-user>/filseg-retrain-a -p ../runs --file-pattern "^(A|AF)/"
 ```
 
 Then, from the repository root:
