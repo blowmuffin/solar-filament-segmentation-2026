@@ -1,0 +1,8 @@
+{
+ "t_lo": 0.5,
+ "peak": 0.99,
+ "mean": 0.9,
+ "min_area": 200,
+ "max_r": 0.9,
+ "tau": null
+}
