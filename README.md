@@ -53,7 +53,7 @@ Matches, false positives and false negatives of the nested row: 5261, 2589, 2938
 | `filseg/preflight.py` | Submission checker (format, overlaps, row counts), pre-submission checks, preview sheet. |
 | `filseg/pq.py` | The competition metric, re-implemented and checked against the host's own scorer. |
 | `filseg/baseline.py` | A no-training baseline (dark structure on a brighter neighbourhood) run through the same rule and metric. |
-| `filseg/tune.py` | Tunes the keep rule: candidate table, grid search, nested out-of-fold evaluation, bootstrap intervals, failure buckets. Writes `filseg/rule.json`. |
+| `filseg/tune.py` | Tunes the keep rule: candidate table, grid search, nested out-of-fold evaluation, bootstrap intervals, failure buckets. With `--rule-out PATH` it writes the rule (`filseg/rule.json`). |
 | `filseg/eda.py` | Data checks: site and year mix, train-test drift, annotator agreement, filament geometry. |
 | `filseg/folds.json` | The frozen assignment of every training image to a fold. |
 | `filseg/rule.json` | The keep rule of `final1` (tuned on all five folds' out-of-fold maps). |
@@ -102,7 +102,7 @@ jupyter lab notebook.ipynb
 
 `work_res` is the resolution the model was trained and predicts at (the image is area-resized to it and the map is brought back to 2048 px); `commit` is the code version that trained it. The weight files are fp16 `state_dict`s of 49 MB each (under GitHub's 100 MB file limit); `infer.load_models` checks the chosen file against its SHA-256 and never downloads anything (the ImageNet initialisation is only needed for training and is overwritten by the trained weights).
 
-`filseg/rule.json` is the keep rule written by `filseg.tune`, the same for both models: `t_lo` 0.5 (component threshold), `peak` 0.99 and `mean` 0.9 (minimum peak and mean probability inside the component), `min_area` 200 (pixels at 2048 px), `max_r` 0.9 (largest allowed distance of the component centre from the disk centre, as a fraction of the solar radius).
+`filseg/rule.json` is the keep rule written by `filseg.tune` from the five-fold out-of-fold maps, used by final1: `t_lo` 0.5 (component threshold), `peak` 0.99 and `mean` 0.9 (minimum peak and mean probability inside the component), `min_area` 200 (pixels at 2048 px), `max_r` 0.9 (largest allowed distance of the component centre from the disk centre, as a fraction of the solar radius). final2 uses `filseg/rule_fold0.json`, tuned on fold 0 alone when that model was the first entry; it differs only in `peak` 0.995.
 
 ## Retrain on Kaggle
 
